@@ -1,0 +1,99 @@
+{$I WaspLib/main.simba}
+
+// TEST (v2, after the WaspLib fix): what does the game cache have at the Lumbridge Castle staircases? Only READS, never clicks.
+// You can start it anywhere (logged in or not). It loads the Lumbridge area the same way the
+// fisher does, then lists every object the cache places around the two staircases on each floor:
+//   ground floor stairs: around game (3205, 3209)    top floor stairs: around game (3205, 3209)
+// For each one: its ID, name, floor it's stored on, the floor WaspLib draws it on, whether
+// WaspLib keeps it (it drops nameless/non-clickable ones), and what WaspLib turns it into.
+// Then it asks WaspLib for every "Staircase" near there, like the fisher does.
+// If something looks wrong, post the log in a GitHub issue.
+
+var
+  loader: TMapLoader;
+  cacheRegion: TRegion;
+  loc: TWorldLocation;
+  def, shown: TObjectDefinition;
+  objs: TObjectDefinitionArray;
+  id, idx, child, drawn, n: Integer;
+  keep: Boolean;
+  line: String;
+  all: TMapObjectDataArray;
+  data: TMapObjectData;
+  p: TPoint;
+begin
+  Logger.Setup('Lumbridge Stairs Test');
+  Logger.Info('Map: loading Lumbridge (ground + top floor), the same as the fisher.');
+  Map.Setup([Chunk(Box(45, 55, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+
+  loader := Map.Loader;
+  loader.SetupChunkLoader();
+  if not loader.ChunkLoader.RegionLoader.LoadRegionAndNeighbors(50, 50) then
+  begin
+    Logger.Warn('Cache: could not load region 50,50 (Lumbridge) at all.');
+    Exit;
+  end;
+  id := loader.ChunkLoader.RegionLoader.Lookup[(50 shl 8) or 50];
+  cacheRegion := loader.ChunkLoader.RegionLoader.Regions[id];
+  objs := loader.ChunkLoader.MapData.Objects;
+  Logger.Info('Cache: Lumbridge region has ' + ToStr(Length(cacheRegion.Locations)) + ' objects placed.');
+
+  for loc in cacheRegion.Locations do
+  begin
+    if (loc.X < 3203) or (loc.X > 3206) or (loc.Y < 3206) or (loc.Y > 3209) then
+      Continue;
+    Inc(n);
+    line := 'Cache: id ' + ToStr(loc.ID) + ' at game (' + ToStr(loc.X) + ', ' + ToStr(loc.Y) +
+            ') stored floor ' + ToStr(loc.Z) + ', type ' + ToStr(loc.LocType) + ', turn ' + ToStr(loc.Orientation);
+
+    idx := objs.IndexOf(loc.ID);
+    if idx = -1 then
+    begin
+      Logger.Info(line + ' -> NO DEFINITION for this id.');
+      Continue;
+    end;
+    def := objs[idx];
+    line += ', name "' + def.Name + '", interact ' + ToStr(def.InteractType) + ', size ' +
+            ToStr(def.SizeX) + 'x' + ToStr(def.SizeY);
+
+    shown := def;
+    if def.ConfigChangeDest <> [] then
+    begin
+      line += ', changes into ' + ToStr(def.ConfigChangeDest);
+      for child in def.ConfigChangeDest do
+        if (objs.IndexOf(child) <> -1) and (objs[objs.IndexOf(child)].Name <> 'null') then
+        begin
+          shown := objs[objs.IndexOf(child)];
+          line += ' (shown as ' + ToStr(child) + ' "' + shown.Name + '", interact ' + ToStr(shown.InteractType) + ')';
+          Break;
+        end;
+    end;
+
+    drawn := TMapObjects.DrawnPlane(cacheRegion, loc);
+    keep := (shown.Name <> 'null') and (shown.InteractType <> 0);
+    line += ', drawn on floor ' + ToStr(drawn);
+    if keep then
+      line += ' -> WaspLib KEEPS it'
+    else
+      line += ' -> WaspLib DROPS it';
+    Logger.Info(line);
+  end;
+  Logger.Info('Cache: ' + ToStr(n) + ' objects around the stairs.');
+
+  try
+    all := MapObjects.GetByName('Staircase');
+  except
+    Logger.Warn('WaspLib: GetByName failed: ' + GetExceptionMessage());
+  end;
+  n := 0;
+  for data in all do
+    for p in data.Coordinates do
+      if (p.X mod RSTranslator.MapWidth) div 4 in [3195..3215] then
+      begin
+        Inc(n);
+        Logger.Info('WaspLib: "Staircase" id ' + ToStr(data.ID) + ' at [' + ToStr(p.X) + ', ' + ToStr(p.Y) +
+                    '] (floor ' + ToStr(p.X div RSTranslator.MapWidth) + '), actions ' + ToStr(data.Actions));
+      end;
+  Logger.Info('WaspLib: ' + ToStr(n) + ' staircases near Lumbridge Castle (of ' + ToStr(Length(all)) + ' staircase kinds loaded).');
+  Logger.Info('TEST DONE - please post this log in a GitHub issue.');
+end.

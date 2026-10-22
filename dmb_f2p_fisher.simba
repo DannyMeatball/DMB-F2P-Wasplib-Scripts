@@ -1,0 +1,2503 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =============================================================================================
+// DMB's F2P Fisher                                      Simba 2.0 + WaspLib (Includes\WaspLib)
+// =============================================================================================
+//
+// FILES (all in Scripts\)
+//   dmb_f2p_fisher.simba      this script
+//   images\dmb_f2p_fisher.png  the picture on the settings window (optional)
+//   Logs go to Data\Logs\DMB's F2P Fisher\
+//
+// HOW TO USE
+//   Start it logged in (or at the login screen). It reads your Fishing and Cooking levels,
+//   then opens the settings window. Pick the spot and the way of fishing, press Start.
+//   While it runs, RuneLite ignores your own mouse and keyboard; they come back when it stops.
+//   It can start from anywhere in the F2P area: it walks to the spot itself.
+//
+// SPOTS                 FISHING                        COOK ON                   BANK
+//   Barbarian Village   Lure: trout, salmon            the permanent fire        Edgeville
+//                       Bait: pike
+//   Draynor Village     Net: shrimps, anchovies        the fire behind the bank  Draynor
+//                       Bait: sardine, herring
+//   Lumbridge Swamp     Net: shrimps, anchovies        Lumbridge Castle range    Lumbridge Castle
+//                       Bait: sardine, herring                                   (top floor)
+//   Lumbridge river     Lure: trout, salmon            Lumbridge Castle range    Lumbridge Castle
+//                       Bait: pike
+//   Musa Point          Cage: lobster                  - (none in F2P)           Port Sarim
+//     (Karamja)         Harpoon: tuna, swordfish                                 deposit box
+//
+// SETTINGS WINDOW
+//   Runtime (minutes)   when time's up it banks what it has, then stops
+//   Spot / Fishing      the spot, then the way of fishing there
+//   Cook                cook the fish before banking (only where there's a range or fire);
+//                       fish you're too low a Cooking level for are banked raw
+//   Power fish          drop the fish instead of cooking/banking
+//
+// ITEMS (taken out of the bank if missing; the bot stops only if the bank has none either)
+//   Net: small fishing net        Bait: fishing rod + fishing bait
+//   Lure: fly fishing rod + feathers   Cage: lobster pot   Harpoon: harpoon
+//   Tools, bait, feathers and coins are never banked. Everything else is, burnt fish included.
+//   MUSA POINT: the Port Sarim deposit box can't hand items out, so start with the tool in the
+//   inventory and at least 60 coins (30 each way on the boat).
+//
+// SAFETY: never goes into the Wilderness; a walk that doesn't move for 8 s is stopped; Home
+// Teleport isn't used; repeated failures stop the script with the reason in the log.
+// =============================================================================================
+
+type
+  EFishState = enum(
+    LOGIN,
+    LEVEL_UP,
+    BANK,
+    COOK,
+    DROP,
+    GO_TO_SPOT,
+    FISH,
+    NO_ACTIVITY,
+    MAX_TIME,
+    STOP
+  );
+
+  // a way of fishing: the spot's menu option, what it needs, what it catches
+  TFishMethod = record
+    Name, Action: String;
+    Tools: TStringArray;        // must be carried (never banked)
+    Bait: String;               // used up while fishing ('' = none)
+    Fish: TStringArray;         // raw fish it catches
+    FishLevels: TIntegerArray;  // Fishing level for each
+  end;
+
+  // a fishing spot
+  TFishArea = record
+    Name: String;
+    Center: TPoint;             // game tiles; the fishing spots within Radius tiles are used
+    Radius: Integer;
+    Methods: TIntegerArray;     // indexes into METHODS
+    BankName: String;           // 'Lumbridge Castle' and 'Port Sarim deposit box' are special
+    BankTile: TPoint;           // game tiles
+    CookTile: TPoint;           // game tiles, [0, 0] = nowhere to cook
+    CookNames: TStringArray;    // what the range/fire is called in WaspLib's data
+    Karamja: Boolean;           // over the water: boat from Port Sarim
+    Extra: TPointArray;         // game tiles of spots WaspLib's data is missing (AddExtraSpots)
+    LandDX, LandDY: Integer;    // where to stand for a spot: spot tile + (LandDX, LandDY), 0,0 = unknown
+    HandFire, HandFireStand: TPoint; // game tiles: a fire WaspLib's data is missing + where to stand (0,0 = none)
+  end;
+
+const
+  ANTIBAN_SLOWDOWN = 3;
+  SAVE_SPOT_PICTURES = False;   // True = save pictures of found spots in Scripts\fisher_spots\ (for tuning)
+  LUMBRIDGE_BANK = 'Lumbridge Castle';
+  DEPOSIT_BOX = 'Port Sarim deposit box';
+  BOAT_FARE = 30;
+
+var
+  METHODS: array of TFishMethod;
+  AREAS: array of TFishArea;
+
+  // raw fish -> Cooking level needed (fish not listed can't be cooked)
+  COOK_FISH: TStringArray = ['Raw shrimps', 'Raw anchovies', 'Raw sardine', 'Raw herring', 'Raw trout',
+                             'Raw pike', 'Raw salmon', 'Raw tuna', 'Raw lobster', 'Raw swordfish'];
+  COOK_LEVELS: TIntegerArray = [1, 1, 1, 5, 15, 20, 25, 30, 40, 45];
+  // cooked and burnt versions (for power fishing: everything that gets dropped)
+  OTHER_FISH: TStringArray = ['Shrimps', 'Anchovies', 'Sardine', 'Herring', 'Trout', 'Pike', 'Salmon',
+                              'Tuna', 'Lobster', 'Swordfish', 'Burnt fish', 'Burnt shrimp',
+                              'Burnt lobster', 'Burnt swordfish'];
+
+  // Lumbridge Castle (tested in the miner): ground-floor staircase, top-floor stairs and booths
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // game (3206, 3209)
+  TOP_STAIRS: TPoint = [64032, 37590];
+  TOP_BANK: TPoint = [64036, 37550];
+
+  // Karamja boat: Port Sarim docks (the seamen) and the Karamja docks (customs officer), game tiles
+  SARIM_DOCK: TPoint = [3028, 3218];
+  KARAMJA_DOCK: TPoint = [2954, 3147];
+
+  // DEBUG (settings tick-box): level / item / coin checks only warn instead of stopping, so
+  // the walking and banking can be tested with any spot
+  DebugMode: Boolean;
+
+  // walker watchdog
+  WalkDeadline, WalkLogAt, WalkStallSince: UInt64;
+  WalkStallSpot: TPoint;
+  WildernessHit: Boolean;
+
+// ---------------------------------------------------------------- spot list
+
+procedure AddMethod(name, action: String; tools: TStringArray; bait: String; fish: TStringArray; levels: TIntegerArray);
+var
+  m: TFishMethod;
+begin
+  m.Name := name;
+  m.Action := action;
+  m.Tools := tools;
+  m.Bait := bait;
+  m.Fish := fish;
+  m.FishLevels := levels;
+  METHODS += m;
+end;
+
+procedure AddArea(name: String; cx, cy, radius: Integer; methods: TIntegerArray; bankName: String;
+                  bx, by, kx, ky: Integer; cookNames: TStringArray; karamja: Boolean);
+var
+  a: TFishArea;
+begin
+  a.Name := name;
+  a.Center := Point(cx, cy);
+  a.Radius := radius;
+  a.Methods := methods;
+  a.BankName := bankName;
+  a.BankTile := Point(bx, by);
+  a.CookTile := Point(kx, ky);
+  a.CookNames := cookNames;
+  a.Karamja := karamja;
+  AREAS += a;
+end;
+
+// A fire WaspLib's data is missing (game tiles): the fire, and the tile to stand on next to it.
+// The bot uses the fish on that exact tile once the hover text there says Fire.
+procedure SetHandFire(name: String; fx, fy, sx, sy: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to High(AREAS) do
+    if AREAS[i].Name = name then
+    begin
+      AREAS[i].HandFire := Point(fx, fy);
+      AREAS[i].HandFireStand := Point(sx, sy);
+      AREAS[i].CookTile := Point(fx, fy);
+    end;
+end;
+
+// Fishing spots WaspLib's data is missing, given as the LAND tile you stand on to fish them, in
+// game coordinates (as the coordinate finder shows them). The spot itself is (dx, dy) from that
+// tile, e.g. dx = -1: one tile west. That also tells the bot where to stand for WaspLib's spots
+// here (the same step back onto the land). Added on top of WaspLib's own spots.
+procedure AddExtraSpots(name: String; landTiles: TPointArray; dx, dy: Integer);
+var
+  i: Integer;
+  p: TPoint;
+begin
+  for i := 0 to High(AREAS) do
+    if AREAS[i].Name = name then
+    begin
+      for p in landTiles do
+        AREAS[i].Extra += Point(p.X + dx, p.Y + dy);
+      AREAS[i].LandDX := -dx;
+      AREAS[i].LandDY := -dy;
+    end;
+end;
+
+// Spot centres are approximate: the bot looks up the real fishing spots near them in
+// WaspLib's NPC data (the log says how many it found).
+procedure SetupAreas();
+const
+  COOK_RANGE: TStringArray = ['Range', 'Cooking range', 'Cook''s range'];
+  COOK_FIRE: TStringArray = ['Fire'];
+begin
+  AddMethod('Net (small fishing net)', 'Net', ['Small fishing net'], '',
+            ['Raw shrimps', 'Raw anchovies'], [1, 15]);                                  // 0
+  AddMethod('Bait (fishing rod + bait)', 'Bait', ['Fishing rod'], 'Fishing bait',
+            ['Raw sardine', 'Raw herring'], [5, 10]);                                    // 1
+  AddMethod('Lure (fly fishing rod + feathers)', 'Lure', ['Fly fishing rod'], 'Feather',
+            ['Raw trout', 'Raw salmon'], [20, 30]);                                      // 2
+  AddMethod('Bait (fishing rod + bait)', 'Bait', ['Fishing rod'], 'Fishing bait',
+            ['Raw pike'], [25]);                                                         // 3 (river)
+  AddMethod('Cage (lobster pot)', 'Cage', ['Lobster pot'], '',
+            ['Raw lobster'], [40]);                                                      // 4
+  AddMethod('Harpoon (harpoon)', 'Harpoon', ['Harpoon'], '',
+            ['Raw tuna', 'Raw swordfish'], [35, 50]);                                    // 5
+
+  AddArea('Barbarian Village', 3105, 3432, 12, [2, 3], 'Edgeville',     3094, 3492, 3105, 3432, COOK_FIRE, False);
+  // Draynor: the permanent fire behind the bank (by the Friendly Forester)
+  AddArea('Draynor Village',   3086, 3229, 10, [0, 1], 'Draynor',       3092, 3243, 3092, 3243, COOK_FIRE, False);
+  AddArea('Lumbridge Swamp',   3244, 3153, 14, [0, 1], LUMBRIDGE_BANK,  3206, 3209, 3211, 3215, COOK_RANGE, False);
+  AddArea('Lumbridge river',   3240, 3249, 12, [2, 3], LUMBRIDGE_BANK,  3206, 3209, 3211, 3215, COOK_RANGE, False);
+  AddArea('Musa Point (Karamja)', 2924, 3178, 10, [4, 5], DEPOSIT_BOX,  3045, 3235,    0,    0, [],   True);
+
+  // spots WaspLib's data is missing (game coordinates)
+  // Lumbridge river: the land tiles you stand on; the spots are one tile west of them
+  AddExtraSpots('Lumbridge river', [Point(3239, 3255), Point(3239, 3254), Point(3239, 3251),
+                                    Point(3240, 3243)], -1, 0);
+  // Barbarian Village: the land tiles you stand on; the spots are one tile east of them
+  AddExtraSpots('Barbarian Village', [Point(3103, 3425), Point(3109, 3434), Point(3109, 3433),
+                                      Point(3109, 3432)], 1, 0);
+
+  // fires WaspLib's data is missing: Barbarian Village's is one tile south of (3106, 3433)
+  SetHandFire('Barbarian Village', 3106, 3432, 3106, 3433);
+end;
+
+// ---------------------------------------------------------------- helpers (from the miner)
+
+// Game tile -> WaspLib map pixels (the same numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// North of the Wilderness ditch (the F2P surface Wilderness, game y 3523 and up)? Map pixels.
+// Underground areas are far off this range, so they never count.
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// An item left selected in the inventory (e.g. after a misclick) makes every click on the
+// game "Use item ->", and the bank / objects can't be opened. Unselect it.
+procedure UnselectItem();
+var
+  sel: Integer;
+begin
+  try
+    sel := Inventory.GetSelected();
+  except
+    Exit;
+  end;
+  if sel < 0 then
+    Exit;
+  Logger.Info('An item in the inventory was selected (slot ' + ToStr(sel + 1) + ') - unselecting it.');
+  Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+  SleepUntil(Inventory.GetSelected() < 0, 100, 1500);
+  Mouse.Move(Point(MainScreen.Bounds.Center.X + Random(-80, 80), MainScreen.Bounds.Center.Y + Random(-60, 60)));
+end;
+
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // never into the Wilderness: stop the walk the moment we're in it or it's heading there
+  // (a destination hundreds of tiles away is a bad point from WaspLib's walker, e.g. on a
+  // floor it has no path for, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  // stuck against a fence/wall WaspLib thinks isn't there: not moved a tile in 8 s -> stop
+  if WalkDeadline > 0 then
+  begin
+    if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+    begin
+      WalkStallSpot := position;
+      WalkStallSince := GetTimeRunning();
+    end
+    else if GetTimeRunning() - WalkStallSince > 8000 then
+    begin
+      Logger.Warn('Walk: not moved for 8 s at [' + ToStr(position.X) + ', ' + ToStr(position.Y) +
+                  '] (stuck on something), stopping this walk.');
+      walker^.Walking := False;
+      WalkDeadline := 0;
+    end;
+  end;
+end;
+
+// WaspLib's walker with a time limit. True when we end within `reachTiles` of `dest`.
+function WebWalkRaw(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  if InWilderness(dest) then
+  begin
+    Logger.Error('Walk: refusing to walk into the Wilderness.');
+    WildernessHit := True;
+    Exit(False);
+  end;
+
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    // WaspLib's route can have points 90+ tiles apart (e.g. south of Varrock). The minimap only
+    // reaches ~15 tiles, so the walker freezes on such a step. Fill in a point every 10 tiles,
+    // then walk that.
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// Where a known tile (map pixels) is on the game screen, from where we stand. False when it's
+// off the screen. This is how the bot "looks from a known spot" instead of searching.
+function TileOnScreen(tile: TPoint; out pt: TPoint): Boolean;
+var
+  mm: TPoint;
+begin
+  mm := TWalker.Point2MM(Map.Position(), tile, Minimap.CompassRadians);
+  pt := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  Result := MainScreen.Bounds.Contains(pt);
+end;
+
+// Hovers points around `center` in growing rings until the hover text contains one of
+// `texts`. Leaves the mouse there (does NOT click).
+function HoverFind(center: TPoint; texts: TStringArray; radius, step: Integer): Boolean;
+var
+  r, k, n: Integer;
+  pt: TPoint;
+  a: Double;
+begin
+  r := 0;
+  while r <= radius do
+  begin
+    if r = 0 then
+      n := 1
+    else
+      n := Max(6, Round(2 * PI * r / step));
+
+    for k := 0 to n - 1 do
+    begin
+      a := 2 * PI * k / n;
+      pt := Point(center.X + Round(r * Cos(a)) + Random(-2, 2), center.Y + Round(r * Sin(a)) + Random(-2, 2));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(texts, True, 0.85, 60) then
+        Exit(True);
+    end;
+    r += step;
+  end;
+end;
+
+// Minimap click `tiles` tiles away in a world direction (dx east, dy north = -1...), whatever
+// way the camera faces. Works where WaspLib's map can't place us (Lumbridge top floor).
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Logger.Warn('WaspLib objects: looking up "' + name + '" failed: ' + GetExceptionMessage());
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if bj = -1 then
+  begin
+    Logger.Warn('WaspLib objects: no "' + names[0] + '" in the loaded map at all.');
+    Exit(False);
+  end;
+  if best > maxTiles * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('WaspLib objects: nearest "' + single.Name + '" is ' + ToStr(Round(best / RSTranslator.TILE_SIZE)) +
+                ' tiles away (want ' + ToStr(maxTiles) + ').');
+    Exit(False);
+  end;
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Logger.Info('WaspLib object: "' + single.Name + '" at [' + ToStr(single.Coordinates[0].X) + ', ' +
+              ToStr(single.Coordinates[0].Y) + '].');
+  Result := True;
+end;
+
+// Use the staircase WaspLib knows next to `spot` with one of `options` ("Top-floor" /
+// "Bottom-floor"). No searching the screen.
+function UseStaircase(spot: TPoint; options: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, t: String;
+  hovered, found, goingDown: Boolean;
+begin
+  goingDown := Pos('ottom', options[0]) > 0;
+
+  // put the mouse on WaspLib's staircase, then right-click and choose the option ourselves
+  if NearestObject(['Staircase'], spot, 6, stairs) then
+    // we're standing next to it: hover it where it is first, only walk if that fails
+    try
+      hovered := stairs.Hover([]);
+      if not hovered then
+        hovered := stairs.WalkHover([]);
+    except
+      Logger.Warn('Stairs: ' + GetExceptionMessage());
+    end
+  else
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  // The menu reader garbles letters ("Too-floor", "Climb-uo"), so don't match the exact
+  // words: "Top-floor" = any line with "floor" that isn't "Bottom"; "Bottom-floor" = a line
+  // with "ottom"/"Bott".
+  found := False;
+  for opt in ChooseOption.GetOptions() do
+  begin
+    menu += '[' + opt.Text + '] ';
+    if found then
+      Continue;
+    t := Lowercase(opt.Text);
+    if Pos('floor', t) = 0 then
+      Continue;
+    if goingDown = ((Pos('ottom', t) > 0) or (Pos('bott', t) > 0)) then
+    begin
+      pick := opt;
+      found := True;
+    end;
+  end;
+
+  if found then
+  begin
+    ChooseOption.Select(pick);    // (selecting a TOption returns nothing)
+    Result := True;
+  end;
+  if not Result then
+  begin
+    Logger.Warn('Stairs: no ' + options[0] + ' option. The menu says: ' + menu);
+    if ChooseOption.IsOpen() then
+      ChooseOption.Close();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicked ' + options[0] + '.');
+  Sleep(2500, 3500);
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+procedure SlowAntiban();
+var
+  i: Integer;
+begin
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// ---------------------------------------------------------------- the fisher
+
+type
+  TFisher = record
+    MaxTime: UInt64;
+    Area: TFishArea;
+    Method: TFishMethod;
+    DoCook, PowerFish: Boolean;
+    State: EFishState;
+    Spots: array of TEntity;      // the fishing spots of this area, from WaspLib's NPC data
+    Snapshots: Integer;           // pictures saved of found spots (SnapSpot)
+    SpotTiles: TPointArray;       // ...and every tile they can be on (map pixels)
+    SpotCenter: TPoint;           // map pixels
+    FishingLevel, CookingLevel: Integer;
+    Caught, Cooked, Trips, Failures: Integer;
+    HaveTools: Boolean;
+    StopReason: String;
+  end;
+
+function TFisher.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Self.Area.Name,
+    ToStr(Self.Caught),
+    FormatNumber(Self.Caught / Logger.TimeRunning.Elapsed * HOUR),
+    ToStr(Self.Cooked),
+    ToStr(Self.Trips),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+// Over the water on Karamja (Musa Point and the Karamja docks)?
+function InKaramja(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2830) and (gx <= 2975) and (gy >= 3130) and (gy <= 3190);
+end;
+
+// Raw fish of this method in the inventory
+function TFisher.RawCount(): Integer;
+var
+  f: String;
+begin
+  for f in Self.Method.Fish do
+    Result += Inventory.Items.Count(f);
+end;
+
+// Items never banked or dropped: the tools, the bait and coins
+function TFisher.KeepItems(): TItemArray;
+var
+  t: String;
+begin
+  for t in Self.Method.Tools do
+    Result += t;
+  if Self.Method.Bait <> '' then
+    Result += Self.Method.Bait;
+  Result += 'Coins';
+end;
+
+// Tools + bait in the inventory (a fly fishing rod / harpoon can also be worn)?
+function TFisher.CheckTools(): Boolean;
+var
+  t: String;
+begin
+  Result := True;
+  for t in Self.Method.Tools do
+    if Inventory.Items.Count(t) = 0 then
+    begin
+      if Equipment.Open() and (Equipment.Items.Count(t) > 0) then
+        Continue;
+      Logger.Info('Items: no ' + t + '.');
+      Result := False;
+    end;
+  Inventory.Open();
+  if (Self.Method.Bait <> '') and (Inventory.Items.Count(Self.Method.Bait) = 0) then
+  begin
+    Logger.Info('Items: no ' + Self.Method.Bait + ' left.');
+    Result := False;
+  end;
+end;
+
+// Cooking level needed for a raw fish (-1 = can't be cooked)
+function CookLevel(raw: String): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to High(COOK_FISH) do
+    if COOK_FISH[i] = raw then
+      Exit(COOK_LEVELS[i]);
+end;
+
+// Raw fish in the inventory that we have the Cooking level for
+function TFisher.HasCookable(): Boolean;
+var
+  f: String;
+begin
+  for f in Self.Method.Fish do
+    if (Inventory.Items.Count(f) > 0) and (CookLevel(f) >= 0) and (CookLevel(f) <= Self.CookingLevel) then
+      Exit(True);
+end;
+
+function TFisher.CanCookHere(): Boolean;
+begin
+  Result := Self.DoCook and (not Self.PowerFish) and
+            ((Self.Area.CookTile.X <> 0) or (Self.Area.CookTile.Y <> 0));
+end;
+
+function HasTile(tiles: TPointArray; t: TPoint): Boolean;
+var
+  p: TPoint;
+begin
+  for p in tiles do
+    if (p.X = t.X) and (p.Y = t.Y) then
+      Exit(True);
+end;
+
+// Along a river the spots sit in a line along the bank, and they move between more places than
+// WaspLib's data lists. So also try the tiles in between two known tiles up to 8 tiles apart.
+procedure TFisher.FillSpotGaps();
+var
+  known, added: TPointArray;
+  a, b, t: TPoint;
+  i, j, k, steps: Integer;
+begin
+  known := Self.SpotTiles;
+  for i := 0 to High(known) do
+    for j := i + 1 to High(known) do
+    begin
+      a := known[i];
+      b := known[j];
+      if a.DistanceTo(b) > 8 * RSTranslator.TILE_SIZE then
+        Continue;
+      steps := Max(Abs(b.X - a.X), Abs(b.Y - a.Y)) div RSTranslator.TILE_SIZE;
+      for k := 1 to steps - 1 do
+      begin
+        t := Point(a.X + Round((b.X - a.X) * k / steps / RSTranslator.TILE_SIZE) * RSTranslator.TILE_SIZE,
+                   a.Y + Round((b.Y - a.Y) * k / steps / RSTranslator.TILE_SIZE) * RSTranslator.TILE_SIZE);
+        if not HasTile(Self.SpotTiles, t) and not HasTile(added, t) then
+          added += t;
+      end;
+    end;
+  Self.SpotTiles += added;
+  if added <> [] then
+    Logger.Info('Spots: also trying ' + ToStr(Length(added)) + ' tiles in between the known ones.');
+end;
+
+// The fishing spots of this area: every NPC with our option (Lure, Net...) in WaspLib's data,
+// keeping only the places within the area's radius.
+procedure TFisher.FindSpots();
+var
+  all: TMapNPCDataArray;
+  data: TMapNPCData;
+  keep: TPointArray;
+  center, p, sum: TPoint;
+  n: Integer;
+begin
+  center := Tile(Self.Area.Center.X, Self.Area.Center.Y);
+  try
+    all := MapNPCs.GetByAction(Self.Method.Action);
+  except
+    Logger.Warn('Spots: ' + GetExceptionMessage());
+  end;
+
+  for data in all do
+  begin
+    keep := [];
+    for p in data.Coordinates do
+      if p.DistanceTo(center) <= Self.Area.Radius * RSTranslator.TILE_SIZE then
+      begin
+        keep += p;
+        sum.X += p.X;
+        sum.Y += p.Y;
+        Inc(n);
+      end;
+    if keep = [] then
+      Continue;
+    data.Coordinates := keep;
+    Self.SpotTiles += keep;
+    Self.Spots += TEntity.Create(Map.Walker, data);
+    Logger.Info('Spots: ' + ToStr(Length(keep)) + ' x "' + data.Name + '" (' + Self.Method.Action + ') at ' + Self.Area.Name + '.');
+  end;
+
+  // spots WaspLib's data is missing, added by hand in SetupAreas
+  for p in Self.Area.Extra do
+  begin
+    Self.SpotTiles += Tile(p.X, p.Y);
+    sum.X += Tile(p.X, p.Y).X;
+    sum.Y += Tile(p.X, p.Y).Y;
+    Inc(n);
+  end;
+  if Self.Area.Extra <> [] then
+    Logger.Info('Spots: ' + ToStr(Length(Self.Area.Extra)) + ' extra spot tiles added by hand.');
+
+  // which tiles these are, in game coordinates, so a missing one is easy to spot
+  for p in Self.SpotTiles do
+    Logger.Info('Spots: known spot tile at game (' + ToStr(p.X div 4) + ', ' + ToStr((50430 - p.Y) div 4) + ').');
+
+  Self.FillSpotGaps();
+
+  if n > 0 then
+    Self.SpotCenter := Point(sum.X div n, sum.Y div n)
+  else
+    Self.SpotCenter := center;
+end;
+
+function TFisher.AtSpot(): Boolean;
+begin
+  Result := Map.Position().DistanceTo(Self.SpotCenter) <= (Self.Area.Radius + 4) * RSTranslator.TILE_SIZE;
+end;
+
+// ---------------------------------------------------------------- init
+
+procedure TFisher.Init();
+var
+  lowest, i: Integer;
+  f: String;
+begin
+  Logger.Setup('DMB''s F2P Fisher');
+  ProgressReport.Setup(
+    'DMB''s F2P Fisher',
+    ['Script runtime:', 'Spot:', 'Fish caught:', 'Fish/H:', 'Cooked:', 'Bank trips:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+  StartListeners(300);
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  Self.FishingLevel := Stats.GetLevel(ESkill.FISHING, False);
+  Self.CookingLevel := Stats.GetLevel(ESkill.COOKING, False);
+  Inventory.Open();
+  Logger.Info('Fishing level: ' + ToStr(Self.FishingLevel) + ', Cooking level: ' + ToStr(Self.CookingLevel) + '.');
+  Logger.Info('Spot: ' + Self.Area.Name + ', ' + Self.Method.Name + '.');
+
+  lowest := 99;
+  for i := 0 to High(Self.Method.FishLevels) do
+    lowest := Min(lowest, Self.Method.FishLevels[i]);
+  if (Self.FishingLevel > 0) and (Self.FishingLevel < lowest) then
+  begin
+    if not DebugMode then
+      raise Self.Method.Name + ' needs ' + ToStr(lowest) + ' Fishing (you have ' + ToStr(Self.FishingLevel) + ').';
+    Logger.Warn('DEBUG: ' + Self.Method.Name + ' needs ' + ToStr(lowest) + ' Fishing (you have ' +
+                ToStr(Self.FishingLevel) + ') - carrying on (the game won''t let you fish).');
+  end;
+
+  if Self.PowerFish then
+    Logger.Info('Power fishing: the fish are dropped.')
+  else if Self.CanCookHere() then
+  begin
+    Logger.Info('Cooking before banking at ' + Self.Area.BankName + '.');
+    for f in Self.Method.Fish do
+      if CookLevel(f) > Self.CookingLevel then
+        Logger.Info('Cooking: ' + f + ' needs Cooking ' + ToStr(CookLevel(f)) + ' (you have ' +
+                    ToStr(Self.CookingLevel) + ') - banked raw until then.');
+  end
+  else
+    Logger.Info('Banking the fish raw at ' + Self.Area.BankName + '.');
+
+  Logger.Info('Map: loading the areas (this can take a moment the first time).');
+  // the F2P surface (Musa Point included) + the top floor of Lumbridge Castle (its bank)
+  Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  Map.Walker.ScreenWalk := False;
+
+  Self.FindSpots();
+  if Self.Spots = [] then
+    Logger.Warn('Spots: WaspLib knows no "' + Self.Method.Action + '" fishing spots here - will look for them on the screen.');
+
+  Self.HaveTools := Self.CheckTools();
+  if Self.HaveTools then
+    Logger.Info('Items: all there.')
+  else if Self.Area.Karamja and DebugMode then
+    Logger.Warn('DEBUG: no tool for Musa Point - carrying on without it.')
+  else if Self.Area.Karamja then
+    raise 'Musa Point banks at a deposit box, which can''t hand out items: start with the ' +
+          'tool (and bait) in the inventory.'
+  else
+    Logger.Info('Items: missing - will take them out of the bank first.');
+
+  if Self.Area.Karamja and (Inventory.Items.CountEx('Coins') < 2 * BOAT_FARE) and DebugMode then
+    Logger.Warn('DEBUG: fewer than ' + ToStr(2 * BOAT_FARE) + ' coins for the boat - carrying on (the boat will refuse).')
+  else if Self.Area.Karamja and (Inventory.Items.CountEx('Coins') < 2 * BOAT_FARE) then
+    raise 'Musa Point needs at least ' + ToStr(2 * BOAT_FARE) + ' coins in the inventory (boat fare both ways).';
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.FISHING, ESkill.TOTAL];
+  SlowAntiban();
+
+  Logger.Info('Start: we are at ' + Here() + ', ' +
+              ToStr(Round(Map.Position().DistanceTo(Self.SpotCenter) / RSTranslator.TILE_SIZE)) + ' tiles from the spot.');
+end;
+
+// ---------------------------------------------------------------- Karamja boat
+
+// WaspLib only counts the deposit box as open when its title reads "Deposit Box", but the game
+// now titles it "The Bank of Gielinor - Item Deposits" (your screenshot): accept that too.
+// (WaspLib's deposit functions use this check too, so they work again.)
+function TDepositBox.IsOpen(): Boolean; override;
+begin
+  Result := inherited();
+  if not Result then
+    Result := MSInterface.IsOpen(EInterfaceType.CLASSIC) and
+              (Self.Title.IsTitle('The Bank of Gielinor - Item Deposits', 0.6) or
+               Self.Title.IsTitle('Item Deposits', 0.5) or Self.Title.IsTitle('Deposit Box', 0.5));
+end;
+
+// Close a deposit box / bank window left open, so the inventory shows again (coin checks).
+procedure CloseWindows();
+begin
+  if DepositBox.IsOpen() then
+  begin
+    DepositBox.Close(True);
+    SleepUntil(not DepositBox.IsOpen(), 100, 3000);
+  end;
+  if Bank.IsOpen() then
+  begin
+    Bank.Close();
+    SleepUntil(not Bank.IsOpen(), 100, 3000);
+  end;
+  Inventory.Open();
+  Sleep(300, 500);                         // let the inventory redraw
+end;
+
+// Coins in the inventory (the whole stack). Windows closed first; read a few times and keep
+// the highest, since a read while something redraws can come back short.
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  CloseWindows();
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= 2 * BOAT_FARE then
+      Break;
+    Sleep(400, 600);
+  end;
+end;
+
+// Talk through the boat dialogue: "click here to continue" and the yes/ok answers.
+procedure HandleBoatChat(ms: Integer);
+var
+  endAt: UInt64;
+begin
+  endAt := GetTimeRunning() + ms;
+  repeat
+    if Chat.ContainsContinue() then
+      Chat.Continue()
+    else if not (Chat.Options.Select('Yes please.', False) or Chat.Options.Select('Yes', False) or
+                 Chat.Options.Select('Ok.', False) or Chat.Options.Select('Search away', False)) then
+      Sleep(300);
+    Sleep(400, 700);
+  until GetTimeRunning() > endAt;
+end;
+
+// The NPC that sells the boat trip at `dock` (map pixels): WaspLib's NPC data by `names`, then
+// anyone with a "Travel" (or "Pay-fare") option. Only the spawn nearest the dock (within 25 tiles) is kept.
+// `payOption` is the option exactly as WaspLib's data spells it.
+function FindBoatNPC(dock: TPoint; names: TStringArray; out npc: TEntity; out payOption: String): Boolean;
+var
+  all: TMapNPCDataArray;
+  data, best: TMapNPCData;
+  p, bestP: TPoint;
+  name, a: String;
+  bestD: Double;
+  i: Integer;
+begin
+  bestD := 25 * RSTranslator.TILE_SIZE + 1;
+
+  for i := 0 to High(names) + 3 do
+  begin
+    try
+      if i <= High(names) then
+        all := MapNPCs.GetByName(names[i])
+      else if i = High(names) + 1 then
+        all := MapNPCs.GetByAction('Travel')
+      else if i = High(names) + 2 then
+        all := MapNPCs.GetByAction('Pay-fare')
+      else
+        all := MapNPCs.GetByAction('Pay-Fare');
+    except
+      all := [];
+    end;
+
+    for data in all do
+      for p in data.Coordinates do
+        if p.DistanceTo(dock) < bestD then
+        begin
+          bestD := p.DistanceTo(dock);
+          best := data;
+          bestP := p;
+        end;
+
+    if bestD <= 25 * RSTranslator.TILE_SIZE then
+      Break;                 // found by name: don't look further
+  end;
+
+  if bestD > 25 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('Boat: WaspLib knows nobody selling the trip near the dock.');
+    Exit(False);
+  end;
+
+  // the trip option: "Travel" (what the game shows), else a "Pay-fare" if that's all there is
+  payOption := 'Travel';
+  for a in best.Actions do
+    if Pos('ay-', Lowercase(a)) > 0 then
+      payOption := a;
+  for a in best.Actions do
+    if Lowercase(a) = 'travel' then
+      payOption := a;
+
+  best.Coordinates := [bestP];
+  npc := TEntity.Create(Map.Walker, best);
+  Logger.Info('Boat: ' + best.Name + ' (WaspLib), ' + ToStr(Round(bestD / RSTranslator.TILE_SIZE)) +
+              ' tiles from the dock, options: ' + ToStr(best.Actions) + ' - using "' + payOption + '".');
+  Result := True;
+end;
+
+// Find an NPC by the NPC dots on the minimap: each nearby dot is turned into its spot on the
+// game screen and only a few points on and just above it are hovered, until the hover text
+// shows one of `names`. Then `option` is picked from the right-click menu.
+function ClickNPCByDots(names: TStringArray; option: String): Boolean;
+var
+  dots: TPointArray;
+  b: TBox;
+  pt: TPoint;
+  i, dx, dy: Integer;
+begin
+  dots := Minimap.GetDots(EDot.NPC).SortFrom(Minimap.Center);
+  for i := 0 to Min(High(dots), 9) do
+  begin
+    if dots[i].DistanceTo(Minimap.Center) > 70 then
+      Break;
+    b := Minimap.Vector2MSQuad([dots[i].X, dots[i].Y, 0], Minimap.CompassRadians).Bounds;
+    if not MainScreen.Bounds.Contains(b.Center) then
+      Continue;
+
+    // a person is about 1 tile wide and 2 tall: the tile and just above it
+    for dy := 0 to 3 do
+      for dx := -1 to 1 do
+      begin
+        pt := Point(b.Center.X + dx * 8 + Random(-2, 2), b.Center.Y - dy * 12 - Random(0, 3));
+        if not MainScreen.Bounds.Contains(pt) then
+          Continue;
+        Mouse.Move(pt);
+        if not MainScreen.IsUpText(names, True, 0.85, 60) then
+          Continue;
+
+        Mouse.Click(EMouseButton.RIGHT);
+        if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+          Continue;
+        Sleep(150, 300);
+        if ChooseOption.Select([option]) then
+        begin
+          Logger.Info('Boat: "' + option + '" on the NPC at minimap dot ' + ToStr(i + 1) + '.');
+          Exit(True);
+        end;
+        CancelMenu();
+      end;
+  end;
+end;
+
+// East of the Lumbridge / Al Kharid fence? Map pixels.
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// ---------------------------------------------------------------- Al Kharid toll gate (from the smelter)
+// Any walk that crosses the Lumbridge / Al Kharid fence goes through the toll gate first, by
+// trying it: "Open" (free with Prince Ali Rescue), the guard / "Pay-toll" with 10+ coins,
+// turning the camera if the gate can't be seen. Not let through: the long way round the fence.
+
+var
+  TOLL_GATE: TPoint = [13068, 37522];
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+  // the long way round the fence (no coins, no Prince Ali Rescue), game tiles
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+// Coins in the inventory (the stack size).
+function GateCoins(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= 10 then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free).
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through: we can't get through here (the caller walks the long way round).
+function CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not WebWalkRaw(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := GateCoins();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= 10 then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if GateMenu(gate, ['oll', 'Pay'], menu) then
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+    begin
+      Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+  // 4) no way through here
+  if coins < 10 then
+    Logger.Warn('Gate: not let through and fewer than 10 coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence (when the toll gate doesn't let us through).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not WebWalkRaw(path[0], 240000, 4) then
+      Exit;
+  end;
+
+  Logger.Info('Long way: walking round the fence.');
+  for i := start to High(path) do
+    if not WebWalkRaw(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+      Exit;
+    end;
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+end;
+
+// WaspLib's walker with our time limit, through the toll gate first when the walk crosses the
+// Lumbridge / Al Kharid fence. True when we end within `reachTiles` of `dest`.
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  me: TPoint;
+  into: Boolean;
+begin
+  me := Map.Position();
+  if (me.X <> 0) and (me.X < RSTranslator.MapWidth) and (dest.X < RSTranslator.MapWidth) and
+     (InAlKharid(me) <> InAlKharid(dest)) and not InWilderness(dest) then
+  begin
+    into := InAlKharid(dest);
+    if not CrossTollGate() then
+    begin
+      Logger.Info('Walk: the toll gate is no good - taking the long way round the fence.');
+      if not WalkLongWay(into) then
+      begin
+        Logger.Warn('Walk: could not get past the Al Kharid fence (toll gate or the long way).');
+        Exit(False);
+      end;
+    end;
+  end;
+  CloseStrayInterface(True);
+  Result := WebWalkRaw(dest, ms, reachTiles);
+  // a window popped up during the walk (misclick): close it and walk again, once
+  if (not Result) and CloseStrayInterface(True) then
+  begin
+    Logger.Info('Walk: a window was in the way - closed it, walking again.');
+    Result := WebWalkRaw(dest, ms, reachTiles);
+  end;
+end;
+
+
+// Port Sarim <-> Karamja by boat: pay the fare (seamen / customs officer), talk through the
+// dialogue; the trip lands us on the other dock.
+function TFisher.TakeBoat(toKaramja: Boolean): Boolean;
+var
+  dock, dest: TPoint;
+  npc: TEntity;
+  payOption, name: String;
+  names: TStringArray;
+  found: Boolean;
+  i, coins: Integer;
+begin
+  coins := CoinCount();
+  if coins < BOAT_FARE then
+  begin
+    Self.StopReason := 'Not enough coins for the boat: read ' + ToStr(coins) + ' gp, need ' + ToStr(BOAT_FARE) + '.';
+    Exit;
+  end;
+
+  if toKaramja then
+    dock := Tile(SARIM_DOCK.X, SARIM_DOCK.Y)
+  else
+    dock := Tile(KARAMJA_DOCK.X, KARAMJA_DOCK.Y);
+
+  if toKaramja then
+    Logger.Info('Boat: to the Port Sarim docks.')
+  else
+    Logger.Info('Boat: to the Karamja docks.');
+  if not SafeWebWalk(dock, 240000, 6) then
+  begin
+    Logger.Warn('Boat: could not walk to the docks (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  // who sells the trip here: each of them from WaspLib's NPC data, "Travel" on the first one
+  // WaspLib can click; then the NPC dots on the minimap (no searching the whole screen)
+  if toKaramja then
+    names := ['Captain Tobias', 'Seaman Thresnor', 'Seaman Lorris']
+  else
+    names := ['Customs officer', 'Customs Officer'];
+
+  found := False;
+  for name in names do
+  begin
+    if not FindBoatNPC(dock, [name], npc, payOption) then
+      Continue;
+    try
+      found := npc.WalkInteract([payOption]);
+    except
+      Logger.Warn('Boat: ' + GetExceptionMessage());
+      found := False;
+    end;
+    if found then
+    begin
+      Logger.Info('Boat: clicked "' + payOption + '" on ' + name + '.');
+      Break;
+    end;
+    Logger.Warn('Boat: WaspLib could not click "' + payOption + '" on ' + name + '.');
+  end;
+
+  if not found then
+  begin
+    Logger.Info('Boat: trying the NPC dots on the minimap.');
+    found := ClickNPCByDots(names, 'Travel');
+  end;
+  if not found then
+  begin
+    Logger.Warn('Boat: could not find who sells the trip.');
+    Exit;
+  end;
+
+  // the dialogue, then the trip (a few seconds of black screen)
+  HandleBoatChat(6000);
+  Sleep(3000, 4000);
+
+  // the trip puts us straight on the other dock: just wait until we're there
+  if toKaramja then
+    dest := Tile(KARAMJA_DOCK.X, KARAMJA_DOCK.Y)
+  else
+    dest := Tile(SARIM_DOCK.X, SARIM_DOCK.Y);
+  Result := SleepUntil((InKaramja(Map.Position()) = toKaramja) and
+                       (Map.Position().DistanceTo(dest) <= 20 * RSTranslator.TILE_SIZE), 500, 15000);
+  if Result then
+    Logger.Info('Boat: across, now at ' + Here() + '.')
+  else
+    Logger.Warn('Boat: still not across (we are at ' + Here() + ').');
+end;
+
+// ---------------------------------------------------------------- travel
+
+function OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+  spot: TPoint;
+begin
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 180000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['Top-floor', 'op-floor', 'Top floor']) then
+      Exit;
+    if not SleepUntil(CurrentFloor() = 2, 300, 5000) then
+      Logger.Warn('Bank: not on the top floor after climbing? We are at ' + Here() + '.');
+  end;
+
+  Logger.Info('Bank: opening the top-floor bank booth.');
+  if NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+  begin
+    WalkStallSpot := Map.Position();
+    WalkStallSince := GetTimeRunning();
+    WalkDeadline := GetTimeRunning() + 45000;
+    try
+      if Bank.Open(booth, True) then
+      begin
+        WalkDeadline := 0;
+        Exit(True);
+      end;
+    except
+      Logger.Warn('Bank: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end;
+
+  // backup: stand at the booths' known tile and look only right around it on the screen
+  if not SafeWebWalk(TOP_BANK, 30000, 2) then
+    StepDirection(0, -1, 10);
+  if not (TileOnScreen(Point(TOP_BANK.X, TOP_BANK.Y - 4), spot) and
+          HoverFind(spot, ['Bank Bank booth', 'Bank booth', 'Bank Banker', 'ank booth'], 50, 10)) then
+  begin
+    Logger.Warn('Bank: no bank booth at the known booth tile on the top floor.');
+    Exit;
+  end;
+  Mouse.Click(EMouseButton.LEFT);
+  Result := SleepUntil(Bank.IsOpen(), 100, 8000);
+end;
+
+function LeaveTopFloor(): Boolean;
+begin
+  Logger.Info('Travel: down the Lumbridge Castle stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  Result := UseStaircase(TOP_STAIRS, ['Bottom-floor', 'ottom-floor', 'Bottom floor']) and
+            SleepUntil(CurrentFloor() = 0, 300, 5000);
+end;
+
+// Fishing spots are in the water, so never walk TO them: follow WaspLib's route towards
+// `target` and stop at the first point within `tiles` of it (route points are always on land).
+// No such point: the route's last point, the nearest land WaspLib's route reaches.
+function LandNear(target: TPoint; tiles: Integer): TPoint;
+var
+  path: TPointArray;
+  p: TPoint;
+begin
+  Result := target;
+  try
+    path := Map.Walker.GetPath(Map.Position(), target, 0);
+  except
+    Exit;
+  end;
+  if path = [] then
+    Exit;
+  for p in path do
+    if p.DistanceTo(target) <= tiles * RSTranslator.TILE_SIZE then
+      Exit(p);
+  Result := path[High(path)];
+end;
+
+// The land tile to stand on to fish a spot tile: known for areas with AddExtraSpots (one step
+// back onto the land), otherwise the end of WaspLib's route towards it.
+function TFisher.StandFor(spot: TPoint): TPoint;
+begin
+  if (Self.Area.LandDX <> 0) or (Self.Area.LandDY <> 0) then
+    Exit(Point(spot.X + Self.Area.LandDX * RSTranslator.TILE_SIZE,
+               spot.Y - Self.Area.LandDY * RSTranslator.TILE_SIZE));   // map Y runs the other way
+  Result := LandNear(spot, 3);
+end;
+
+procedure TFisher.GoToSpot();
+var
+  land: TPoint;
+begin
+  if CurrentFloor() > 0 then
+    if not LeaveTopFloor() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 5 then
+        Self.StopReason := 'Could not get down the Lumbridge Castle stairs. Please post this log in a GitHub issue.'
+      else
+        Sleep(1500, 2500);
+      Exit;
+    end;
+
+  if Self.Area.Karamja and not InKaramja(Map.Position()) then
+    if not Self.TakeBoat(True) then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 3 then
+        Self.StopReason := 'Could not take the boat to Karamja. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+
+  // to the land next to the spots (the spots themselves are in the water)
+  land := LandNear(Self.SpotCenter, 6);
+  Logger.Info('Travel: to ' + Self.Area.Name + ' (' +
+              ToStr(Round(Map.Position().DistanceTo(land) / RSTranslator.TILE_SIZE)) + ' tiles).');
+  if SafeWebWalk(land, 300000, 3) or Self.AtSpot() then
+  begin
+    Logger.Info('Travel: at ' + Self.Area.Name + '.');
+    Self.Failures := 0;
+    Activity.Restart();
+    Exit;
+  end;
+
+  Inc(Self.Failures);
+  if Self.Failures >= 3 then
+    Self.StopReason := 'WaspLib''s walker can''t reach ' + Self.Area.Name + ' from ' + Here() + '. Please post this log in a GitHub issue.';
+end;
+
+// ---------------------------------------------------------------- fishing
+
+// Hover a known spot tile on the game screen: WaspLib gives the tile, we turn it into its spot on
+// the screen (minimap -> main screen, like the essence script) and hover just there - no colour
+// finding (a fishing spot is a see-through ripple, colours don't work on it).
+// A spot was found: save what it looks like for tuning the script, the first 60 times a run.
+// Pictures go to Scripts\fisher_spots\ : spot_N.png (the spot close up, 120x120 around the
+// mouse) and screen_N.png (the whole game screen). The log says which tile and where it hovered.
+procedure TFisher.SnapSpot(tile, pt: TPoint; hover: Integer);
+var
+  dir, name: String;
+  img: TImage;
+  me: TPoint;
+begin
+  if (not SAVE_SPOT_PICTURES) or (Self.Snapshots >= 60) then
+    Exit;
+  Inc(Self.Snapshots);
+  me := Map.Position();
+  Logger.Info('Spot found #' + ToStr(Self.Snapshots) + ': spot tile game (' + ToStr(tile.X div 4) + ', ' +
+              ToStr((50430 - tile.Y) div 4) + '), me at game (' + ToStr(me.X div 4) + ', ' +
+              ToStr((50430 - me.Y) div 4) + '), mouse at [' + ToStr(pt.X) + ', ' + ToStr(pt.Y) +
+              '], hover try ' + ToStr(hover) + ' (0 half north, 1 tile north, 2 tile, 3-5 sides)' + ', compass ' + ToStr(Round(RadToDeg(Minimap.CompassRadians))) + ' deg.');
+  try
+    dir := {$MACRO DIR} + 'fisher_spots' + PATH_SEP;
+    DirCreate(dir);
+    name := ToStr(Self.Snapshots);
+    img := Target.GetImage(Box(pt.X - 60, pt.Y - 60, pt.X + 60, pt.Y + 60).Clip(MainScreen.Bounds));
+    img.Save(dir + 'spot_' + name + '.png', True);
+    if Self.Snapshots <= 10 then   // whole screen only for the first 10 (they're big)
+    begin
+      img := Target.GetImage(MainScreen.Bounds);
+      img.Save(dir + 'screen_' + name + '.png', True);
+    end;
+    Logger.Info('Spot found #' + name + ': pictures saved in ' + dir);
+  except
+    Logger.Warn('Spot picture not saved: ' + GetExceptionMessage());
+  end;
+end;
+
+function TFisher.TryTile(me, tile: TPoint): Boolean;
+var
+  mm, ms, north, pt: TPoint;
+  k: Integer;
+begin
+  mm := TWalker.Point2MM(me, tile, Minimap.CompassRadians);
+  ms := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  if not MainScreen.Bounds.Contains(ms) then
+    Exit;
+  // the same tile one step north on the screen: the pictures showed the mouse landing about a
+  // tile south of the spot, so also try half and a whole tile north of the projected point
+  mm := TWalker.Point2MM(me, Point(tile.X, tile.Y - RSTranslator.TILE_SIZE), Minimap.CompassRadians);
+  north := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+
+  for k := 0 to 5 do
+  begin
+    // the logged finds hit mostly half a tile to a tile north of WaspLib's tile, so start there
+    case k of
+      0: pt := Point((ms.X + north.X) div 2, (ms.Y + north.Y) div 2);
+      1: pt := north;
+      2: pt := ms;
+      3: pt := Point(ms.X - 10, ms.Y - 6);
+      4: pt := Point(ms.X + 10, ms.Y - 6);
+      5: pt := Point(ms.X, ms.Y + 8);
+    end;
+    pt := Point(pt.X + Random(-2, 2), pt.Y + Random(-2, 2));
+    if not MainScreen.Bounds.Contains(pt) then
+      Continue;
+    Mouse.Move(pt);
+    if not MainScreen.IsUpText(['Fishing spot', 'ishing spot'], True, 0.85, 60) then
+      Continue;
+    Self.SnapSpot(tile, pt, k);
+
+    // left-click is our option: click. Otherwise right-click and pick it.
+    if MainScreen.IsUpText([Self.Method.Action], True, 0.85, 30) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+    Mouse.Click(EMouseButton.RIGHT);
+    if SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+    begin
+      Sleep(120, 250);
+      if ChooseOption.Select([Self.Method.Action]) then
+        Exit(True);
+      CancelMenu();
+    end;
+  end;
+end;
+
+// Click a fishing spot, always from a known location, never by searching the screen:
+// 1) WaspLib's spot tiles near us, nearest first, each hovered right where it is on the screen.
+// 2) Then walk along to the known tiles not looked at yet, until all have been tried. Nothing
+// there: wait a moment (spots move between the known tiles). No colour finding (it picked ducks).
+function TFisher.ClickSpot(): Boolean;
+var
+  me, t, pt: TPoint;
+  tiles, tried, left, seen: TPointArray;
+  walks, turn: Integer;
+begin
+  // Work through EVERY known spot tile of the area (WaspLib's, the hand-added ones and the ones
+  // in between): hover the ones on the screen, then walk to the nearest one not tried yet.
+  for walks := 0 to 8 do
+  begin
+    // let the character come to rest first: while it's still moving the spots aren't where
+    // the screen math puts them
+    SleepUntil(not Minimap.IsPlayerMoving(), 150, 6000);
+    Sleep(900, 1300);
+
+    // look at the tiles on the screen; nothing there: turn the camera a quarter turn and look
+    // again (a spot can be hidden behind something or seen badly from one side) - 3 turns
+    seen := [];
+    for turn := 0 to 3 do
+    begin
+      me := Map.Position();
+      tiles := Self.SpotTiles.SortFrom(me);   // nearest first
+      for t in tiles do
+      begin
+        if HasTile(tried, t) or not TileOnScreen(t, pt) then
+          Continue;
+        if not HasTile(seen, t) then
+          seen += t;
+        if Self.TryTile(me, t) then
+          Exit(True);
+      end;
+      if (seen = []) or (turn = 3) then
+        Break;
+      Logger.Info('Fish: no spot from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(700, 1100);
+    end;
+    tried += seen;
+
+    left := [];
+    for t in tiles do
+      if not HasTile(tried, t) then
+        left += t;
+    if left = [] then
+      Break;
+
+    // the nearest known tile we haven't looked at yet (left is still nearest first)
+    Logger.Info('Fish: checking the spots at game (' + ToStr(left[0].X div 4) + ', ' +
+                ToStr((50430 - left[0].Y) div 4) + ').');
+    SafeWebWalk(Self.StandFor(left[0]), 30000, 1);
+    Map.Walker.WaitMoving();
+    if not TileOnScreen(left[0], pt) then
+      tried += left[0];   // still can't see it from the bank: don't keep walking to it
+  end;
+
+  // every known tile checked and none has a spot right now: wait, spots move
+  Logger.Info('Fish: no spot on any known tile right now - waiting for one.');
+  Sleep(2000, 3500);
+end;
+
+procedure TFisher.DoFish();
+var
+  start, last: Integer;
+begin
+  if not Self.ClickSpot() then
+  begin
+    Logger.Info('Fish: no fishing spot found here - back to the bank of the river by the spots.');
+    SafeWebWalk(LandNear(Self.SpotCenter, 6), 60000, 3);
+    Inc(Self.Failures);
+    if Self.Failures >= 6 then
+      Self.StopReason := 'Could not find a fishing spot at ' + Self.Area.Name + '. Please post this log in a GitHub issue.';
+    Exit;
+  end;
+
+  Map.Walker.WaitMoving();
+  start := Self.RawCount();
+
+  // fishing goes on by itself until the spot moves: click again when nothing comes in for ~15 s
+  repeat
+    last := Self.RawCount();
+    if Inventory.IsFull() or Chat.LeveledUp() then
+      Break;
+    if (Self.Method.Bait <> '') and (Inventory.Items.Count(Self.Method.Bait) = 0) then
+      Break;
+    Antiban.DoAntiban();
+  until not SleepUntil(Self.RawCount() > last, 300, Random(13000, 17000));
+
+  Self.Caught += Max(0, Self.RawCount() - start);
+  Self.Failures := 0;
+  Activity.Restart();
+end;
+
+// ---------------------------------------------------------------- cooking
+
+// The cook menu is open: click the fish (its hover hint names the cooked fish, e.g. "Trout").
+// Only one choice -> click that one.
+function ClickCookItem(raw: String): Boolean;
+var
+  boxes: TBoxArray;
+  b: TBox;
+  name: String;
+begin
+  name := Lowercase(Copy(raw, 5, 40));        // 'Raw trout' -> 'trout'
+  boxes := Make.GetItemBoxes();
+  for b in boxes do
+  begin
+    Mouse.Move(b);
+    if Make.WaitHint(1500) and (Pos(name, Lowercase(Make.ReadHint())) > 0) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+  if Length(boxes) = 1 then
+  begin
+    Mouse.Click(boxes[0], EMouseButton.LEFT);
+    Exit(True);
+  end;
+end;
+
+// Click the hand-added fire (like a range): stand next to it, hover the fire's tile and click
+// once the hover text says Cook / Fire - the game opens the cook menu.
+function TFisher.UseOnHandFire(fish: String): Boolean;
+var
+  fire, pt, p: TPoint;
+  k: Integer;
+begin
+  fire := Tile(Self.Area.HandFire.X, Self.Area.HandFire.Y);
+  if Map.Position().DistanceTo(fire) > 3 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Info('Cook: walking to the fire.');
+    SafeWebWalk(Tile(Self.Area.HandFireStand.X, Self.Area.HandFireStand.Y), 30000, 1);
+    Map.Walker.WaitMoving();
+  end;
+  if not TileOnScreen(fire, pt) then
+  begin
+    Logger.Warn('Cook: the fire''s tile isn''t on the screen (we are at ' + Here() + ').');
+    Exit;
+  end;
+  for k := 0 to 14 do
+  begin
+    if (k = 5) or (k = 10) then
+    begin
+      // not seen from this angle: turn the camera a quarter turn and look again
+      Logger.Info('Cook: can''t see the fire from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(700, 1100);
+      if not TileOnScreen(fire, pt) then
+        Break;
+    end;
+    case k mod 5 of
+      0: p := pt;
+      1: p := Point(pt.X, pt.Y - 10);
+      2: p := Point(pt.X - 8, pt.Y - 5);
+      3: p := Point(pt.X + 8, pt.Y - 5);
+      4: p := Point(pt.X, pt.Y + 6);
+    end;
+    p := Point(p.X + Random(-2, 2), p.Y + Random(-2, 2));
+    if not MainScreen.Bounds.Contains(p) then
+      Continue;
+    Mouse.Move(p);
+    if MainScreen.IsUpText(['Cook', 'Fire', 'fire'], True, 0.85, 60) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Logger.Info('Cook: clicked the fire (for the ' + fish + ').');
+      Exit(True);
+    end;
+  end;
+
+  Logger.Warn('Cook: no Cook / Fire hover text on the fire''s tile.');
+end;
+
+// Use each raw fish we can cook on the range / fire, "All" in the make menu, and wait.
+procedure TFisher.CookFish();
+var
+  cooker: TObject;
+  f: String;
+  tries, last, before: Integer;
+  hand: Boolean;
+begin
+  // a fire added by hand (WaspLib's data doesn't have it): use that
+  hand := (Self.Area.HandFire.X <> 0) or (Self.Area.HandFire.Y <> 0);
+  if (not hand) and not NearestObject(Self.Area.CookNames, Tile(Self.Area.CookTile.X, Self.Area.CookTile.Y), 15, cooker) then
+  begin
+    Logger.Warn('Cook: WaspLib knows no ' + Self.Area.CookNames[0] + ' here - banking the fish raw from now on.');
+    Self.DoCook := False;
+    Exit;
+  end;
+
+  for f in Self.Method.Fish do
+  begin
+    if (CookLevel(f) < 0) or (CookLevel(f) > Self.CookingLevel) then
+      Continue;
+
+    for tries := 1 to 4 do
+    begin
+      if Inventory.Items.Count(f) = 0 then
+        Break;
+      before := Inventory.Items.Count(f);
+      Logger.Info('Cook: ' + ToStr(before) + ' x ' + f + '.');
+
+      if hand then
+      begin
+        if not Self.UseOnHandFire(f) then
+          Continue;
+      end
+      else
+      try
+        if not Inventory.Items.Interact(f, 'Use') then
+          Continue;
+        if not cooker.WalkClick(True) then
+        begin
+          Logger.Warn('Cook: could not click the ' + Self.Area.CookNames[0] + '.');
+          Continue;
+        end;
+      except
+        Logger.Warn('Cook: ' + GetExceptionMessage());
+        Continue;
+      end;
+      Map.Walker.WaitMoving();
+
+      // "How many would you like to cook?" - the quantity is already All: just click the fish
+      if Make.WaitOpen(4000) then
+      begin
+        if ClickCookItem(f) then
+          Logger.Info('Cook: cooking the ' + f + '.')
+        else
+          Logger.Warn('Cook: could not find the ' + f + ' in the cook menu.');
+      end
+      else
+        Logger.Warn('Cook: the cook menu did not open.');
+
+      // cooking runs by itself; a level up stops it (then we go again)
+      repeat
+        last := Inventory.Items.Count(f);
+        if last = 0 then
+          Break;
+        if Chat.LeveledUp() then
+        begin
+          Chat.HandleLevelUp();
+          Self.CookingLevel := Stats.GetLevel(ESkill.COOKING, False);
+          Inventory.Open();
+          Break;
+        end;
+      until not SleepUntil(Inventory.Items.Count(f) < last, 200, 6000);
+
+      Self.Cooked += Max(0, before - Inventory.Items.Count(f));
+    end;
+  end;
+  Activity.Restart();
+end;
+
+// ---------------------------------------------------------------- bank / drop
+
+// Take out whatever tool or bait we are missing.
+function TFisher.WithdrawTools(): Boolean;
+var
+  t: String;
+begin
+  for t in Self.Method.Tools do
+    if Inventory.Items.Count(t) = 0 then
+    begin
+      Logger.Info('Bank: taking out a ' + t + '.');
+      Bank.Withdraw(new TBankItem(t, 1));
+      SleepUntil(Inventory.Items.Count(t) > 0, 100, 2000);
+    end;
+  if (Self.Method.Bait <> '') and (Inventory.Items.Count(Self.Method.Bait) = 0) then
+  begin
+    Logger.Info('Bank: taking out all the ' + Self.Method.Bait + '.');
+    Bank.Withdraw(new TBankItem(Self.Method.Bait, QUANTITY_ALL));
+    SleepUntil(Inventory.Items.Count(Self.Method.Bait) > 0, 100, 2000);
+  end;
+
+  Result := True;
+  for t in Self.Method.Tools do
+    if Inventory.Items.Count(t) = 0 then
+      Result := False;
+  if (Self.Method.Bait <> '') and (Inventory.Items.Count(Self.Method.Bait) = 0) then
+    Result := False;
+end;
+
+// The deposit box nearest `near` (map pixels) from WaspLib's object data: anything with a
+// "Deposit" option, else by name. Within 30 tiles.
+function FindDepositBox(near: TPoint; out box: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  data, best: TMapObjectData;
+  bestD: Double;
+  i, j, bj: Integer;
+begin
+  bestD := 30 * RSTranslator.TILE_SIZE + 1;
+  for i := 0 to 2 do
+  begin
+    try
+      case i of
+        0: all := MapObjects.GetByAction('Deposit');
+        1: all := MapObjects.GetByName('Bank deposit box');
+        2: all := MapObjects.GetByName('Deposit box');
+      end;
+    except
+      all := [];
+    end;
+    for data in all do
+      for j := 0 to High(data.Coordinates) do
+        if data.Coordinates[j].DistanceTo(near) < bestD then
+        begin
+          bestD := data.Coordinates[j].DistanceTo(near);
+          best := data;
+          bj := j;
+        end;
+    if bestD <= 30 * RSTranslator.TILE_SIZE then
+      Break;
+  end;
+
+  if bestD > 30 * RSTranslator.TILE_SIZE then
+    Exit(False);
+
+  Logger.Info('Bank: ' + best.Name + ' (WaspLib) at [' + ToStr(best.Coordinates[bj].X) + ', ' +
+              ToStr(best.Coordinates[bj].Y) + '], options: ' + ToStr(best.Actions) + '.');
+  best.Coordinates := [best.Coordinates[bj]];
+  if bj <= High(best.Rotations) then
+    best.Rotations := [best.Rotations[bj]];
+  box := TObject.Create(Map.Walker, best);
+  Result := True;
+end;
+
+procedure TFisher.DoDepositBox();
+var
+  box: TObject;
+  opened: Boolean;
+begin
+  if InKaramja(Map.Position()) then
+    if not Self.TakeBoat(False) then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 3 then
+        Self.StopReason := 'Could not take the boat back from Karamja. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+
+  Logger.Info('Bank: to the Port Sarim deposit box.');
+  // the one nearest the dock we land at (the Port Sarim docks)
+  if not FindDepositBox(Tile(SARIM_DOCK.X, SARIM_DOCK.Y), box) then
+  begin
+    Self.StopReason := 'WaspLib knows no deposit box near the Port Sarim docks. Please post this log in a GitHub issue.';
+    Exit;
+  end;
+
+  try
+    // WaspLib walks to it and clicks "Deposit"; its own Open() as the backup
+    opened := box.WalkInteract(['Deposit']) and DepositBox.WaitOpen(6000);
+    if not opened then
+      opened := DepositBox.Open(box, True);
+    if not opened then
+    begin
+      CloseWindows();
+      Inc(Self.Failures);
+      Logger.Warn('Bank: could not open the deposit box (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Logger.Info('Bank: depositing everything except the tools, bait and coins.');
+    DepositBox.DepositDifferent(Self.KeepItems());
+    Sleep(600, 1000);
+    CloseWindows();
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+    Inc(Self.Failures);
+    Exit;
+  end;
+
+  Logger.Info('Bank: ' + ToStr(CoinCount()) + ' coins left for the boat.');
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  Activity.Restart();
+  Logger.Info('Bank: trip ' + ToStr(Self.Trips) + ' done.');
+end;
+
+procedure TFisher.DoBank();
+var
+  booth: TObject;
+  opened: Boolean;
+begin
+  if Self.Area.BankName = DEPOSIT_BOX then
+  begin
+    Self.DoDepositBox();
+    Exit;
+  end;
+
+  if not Bank.IsOpen() then
+  begin
+    if Self.Area.BankName = LUMBRIDGE_BANK then
+      opened := OpenLumbridgeBank()
+    else
+    begin
+      Logger.Info('Bank: to ' + Self.Area.BankName + '.');
+      // walk there ourselves first: our walk has a time limit and the 8 s stuck check. Bank.Open's
+      // own walking has neither (it once kept walking for an hour after a logout)
+      if Map.Position().DistanceTo(Tile(Self.Area.BankTile.X, Self.Area.BankTile.Y)) > 8 * RSTranslator.TILE_SIZE then
+        SafeWebWalk(Tile(Self.Area.BankTile.X, Self.Area.BankTile.Y), 300000, 6);
+      // the last few tiles + opening: with the stuck check and a time limit too
+      WalkStallSpot := Map.Position();
+      WalkStallSince := GetTimeRunning();
+      WalkDeadline := GetTimeRunning() + 45000;
+      try
+        if NearestObject(['Bank booth', 'Bank Booth', 'Bank chest'], Tile(Self.Area.BankTile.X, Self.Area.BankTile.Y), 10, booth) then
+          opened := Bank.Open(booth, True)
+        else
+          opened := Bank.Open(True);
+      except
+        Logger.Warn('Bank: ' + GetExceptionMessage());
+      end;
+      WalkDeadline := 0;
+    end;
+
+    if not (opened or Bank.IsOpen()) then
+    begin
+      Inc(Self.Failures);
+      Logger.Warn('Bank: could not open the bank (we are at ' + Here() + ').');
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not reach/open ' + Self.Area.BankName + ' bank. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: depositing everything except the tools, bait and coins.');
+  if Bank.DepositDifferent(Self.KeepItems()) then
+    SleepUntil(not Inventory.Items.ContainsDifferent(Self.KeepItems()), 100, 3000);
+
+  if not Self.HaveTools then
+  begin
+    Self.HaveTools := Self.WithdrawTools();
+    if (not Self.HaveTools) and DebugMode then
+    begin
+      Logger.Warn('DEBUG: no tools/bait for ' + Self.Method.Name + ' in the bank either - going to the spot anyway.');
+      Self.HaveTools := True;
+    end;
+    if not Self.HaveTools then
+    begin
+      Self.StopReason := 'Missing tools/bait for ' + Self.Method.Name + ', and the bank has none either.';
+      Bank.Close();
+      Exit;
+    end;
+  end;
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  Bank.Close();
+  Activity.Restart();
+  Logger.Info('Bank: trip ' + ToStr(Self.Trips) + ' done. Back to ' + Self.Area.Name + '.');
+end;
+
+procedure TFisher.DoDrop();
+var
+  items: TItemArray;
+  f: String;
+begin
+  for f in Self.Method.Fish do
+    items += f;
+  for f in OTHER_FISH do
+    items += f;
+  Logger.Info('Drop: dropping the fish.');
+  Inventory.Drop(items);
+  Activity.Restart();
+end;
+
+// ---------------------------------------------------------------- main loop
+
+// A single misread position can land "in the Wilderness": only believe it after 3 reads.
+function ReallyInWilderness(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InWilderness(Map.Position()) then
+      Exit(False);
+    if i < 3 then
+      Sleep(700, 900);
+  end;
+  Result := True;
+end;
+
+
+function TFisher.GetState(): EFishState;
+begin
+  if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+  begin
+    if Self.StopReason = '' then
+      Self.StopReason := 'Stopped at the Wilderness. Move the character out and restart.';
+    Exit(EFishState.STOP);
+  end;
+  if Self.StopReason <> '' then
+    Exit(EFishState.STOP);
+  if Activity.IsFinished then
+    Exit(EFishState.NO_ACTIVITY);
+  if not Client.IsLoggedIn() then
+    Exit(EFishState.LOGIN);
+  if Chat.LeveledUp() then
+    Exit(EFishState.LEVEL_UP);
+  if Bank.IsOpen() then
+    Exit(EFishState.BANK);
+
+  // missing a tool or out of bait: the bank first
+  if not Self.HaveTools then
+    Exit(EFishState.BANK);
+  if (Self.Method.Bait <> '') and (Inventory.Items.Count(Self.Method.Bait) = 0) then
+  begin
+    Self.HaveTools := False;
+    Exit(EFishState.BANK);
+  end;
+
+  if Inventory.IsFull() then
+  begin
+    if Self.PowerFish then
+      Exit(EFishState.DROP);
+    if Self.CanCookHere() and Self.HasCookable() then
+      Exit(EFishState.COOK);
+    Exit(EFishState.BANK);
+  end;
+
+  // time's up: bank what we have, then stop
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+  begin
+    if (not Self.PowerFish) and (Inventory.Items.ContainsDifferent(Self.KeepItems())) then
+    begin
+      if Self.CanCookHere() and Self.HasCookable() then
+        Exit(EFishState.COOK);
+      Exit(EFishState.BANK);
+    end;
+    Exit(EFishState.MAX_TIME);
+  end;
+
+  if not Self.AtSpot() then
+    Exit(EFishState.GO_TO_SPOT);
+
+  Result := EFishState.FISH;
+end;
+
+procedure TFisher.Run();
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    if Self.State <> EFishState.FISH then
+      Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      EFishState.LOGIN: DoLoginSafe();
+      EFishState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+          Self.FishingLevel := Stats.GetLevel(ESkill.FISHING, False);
+          Self.CookingLevel := Stats.GetLevel(ESkill.COOKING, False);
+          Inventory.Open();
+          Logger.Info('LEVEL UP: Fishing ' + ToStr(Self.FishingLevel) + ', Cooking ' + ToStr(Self.CookingLevel) + '.');
+        end;
+      EFishState.BANK: Self.DoBank();
+      EFishState.COOK: Self.CookFish();
+      EFishState.DROP: Self.DoDrop();
+      EFishState.GO_TO_SPOT: Self.GoToSpot();
+      EFishState.FISH: Self.DoFish();
+      EFishState.NO_ACTIVITY, EFishState.MAX_TIME, EFishState.STOP: Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  if Self.StopReason <> '' then
+    Logger.Error('Stopped: ' + Self.StopReason)
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+// ---------------------------------------------------------------- GUI
+
+var
+  Fisher: TFisher;
+  FisherForm: TScriptForm;
+  RuntimeEdit: TLazEdit;
+  AreaSelector, MethodSelector: TLazComboBox;
+  CookBox, PowerBox, DebugBox: TLazCheckBox;
+  GuiFishingLevel, GuiCookingLevel: Integer;
+
+// The ways of fishing at the chosen spot; Cook only where there's a range or fire.
+procedure TScriptForm.OnAreaChange(sender: TLazObject);
+var
+  a: TFishArea;
+  i, lowest, k: Integer;
+  txt: String;
+begin
+  a := AREAS[Max(0, AreaSelector.ItemIndex)];
+
+  MethodSelector.Items.Clear();
+  for i := 0 to High(a.Methods) do
+  begin
+    txt := METHODS[a.Methods[i]].Name + ': ';
+    lowest := 99;
+    for k := 0 to High(METHODS[a.Methods[i]].Fish) do
+    begin
+      if k > 0 then
+        txt += ', ';
+      txt += Copy(METHODS[a.Methods[i]].Fish[k], 5, 40) + ' (' + ToStr(METHODS[a.Methods[i]].FishLevels[k]) + ')';
+      lowest := Min(lowest, METHODS[a.Methods[i]].FishLevels[k]);
+    end;
+    if (GuiFishingLevel > 0) and (lowest > GuiFishingLevel) then
+      txt += ' - LOCKED: needs ' + ToStr(lowest) + ' Fishing (tick Debug to try anyway)';
+    MethodSelector.Items.Add(txt);
+  end;
+  MethodSelector.ItemIndex := 0;
+
+  CookBox.Enabled := (a.CookTile.X <> 0) or (a.CookTile.Y <> 0);
+  if not CookBox.Enabled then
+    CookBox.Checked := False;
+end;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Fisher.MaxTime := minutes * MINUTE;
+  Fisher.Area := AREAS[Max(0, AreaSelector.ItemIndex)];
+  Fisher.Method := METHODS[Fisher.Area.Methods[Max(0, MethodSelector.ItemIndex)]];
+  Fisher.DoCook := CookBox.Checked;
+  Fisher.PowerFish := PowerBox.Checked;
+  DebugMode := DebugBox.Checked;
+  if DebugMode then
+    Logger.Warn('DEBUG MODE: level, item and coin checks only warn - for testing the walking.');
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i: Integer;
+  imgPath: String;
+  pic: TLazImage;
+begin
+  if GuiFishingLevel > 0 then
+    Self.Setup('DMB''s F2P Fisher - Fishing ' + ToStr(GuiFishingLevel) + ', Cooking ' + ToStr(GuiCookingLevel))
+  else
+    Self.Setup('DMB''s F2P Fisher');
+  tab := Self.CreateTab('Fisher');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run. It banks what it has before stopping.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  AreaSelector := TLazComboBox.CreateEx(tab, 'Spot:', 'Where to fish. The bot walks there from wherever you are.', 40, 110, 320);
+  for i := 0 to High(AREAS) do
+    AreaSelector.Items.Add(AREAS[i].Name + ' (bank: ' + AREAS[i].BankName + ')');
+  AreaSelector.ItemIndex := 0;
+
+  MethodSelector := TLazComboBox.CreateEx(tab, 'Fishing:', 'The way of fishing (and the Fishing level each fish needs).', 40, 180, 420);
+
+  CookBox := TLazCheckBox.CreateEx(tab, 'Cook the fish before banking', 'Only where there is a range or fire. Fish you are too low a Cooking level for are banked raw.', 40, 250);
+  CookBox.Checked := True;
+  PowerBox := TLazCheckBox.CreateEx(tab, 'Power fish (drop instead of cooking/banking)', 'Drops all the fish when the inventory is full.', 40, 280);
+  // debugging: a LOCKED way of fishing runs anyway, missing tools/bait/coins only warn
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the level, item and coin checks',
+    'For testing the walking only. A LOCKED way of fishing starts anyway, and missing tools, bait or boat coins only give a warning: it still walks to the spot and the bank. The game itself won''t let you fish what you lack.', 40, 330);
+
+  AreaSelector.OnChange := @Self.OnAreaChange;
+  Self.OnAreaChange(nil);
+
+  // your picture: Scripts\images\dmb_f2p_fisher.png (shown if it exists)
+  imgPath := {$MACRO DIR} + 'images' + PATH_SEP + 'dmb_f2p_fisher.png';
+  if not FileExists(imgPath) then
+    imgPath := {$MACRO DIR} + 'dmb_f2p_fisher.png';      // old place: next to the script
+  if FileExists(imgPath) then
+  begin
+    pic := TLazImage.CreateEx(tab);
+    pic.SetBounds(480, 30, 290, 300);
+    pic.Stretch := True;
+    pic.Proportional := True;
+    pic.Picture.LoadFromFile(imgPath);
+  end;
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  SetupAreas();
+
+  // levels BEFORE the window, so ways of fishing you're too low for can be marked
+  Logger.Info('Reading your Fishing and Cooking levels before opening the settings...');
+  try
+    if not Client.IsLoggedIn() then
+      DoLoginSafe();
+    GuiFishingLevel := Stats.GetLevel(ESkill.FISHING, False);
+    GuiCookingLevel := Stats.GetLevel(ESkill.COOKING, False);
+    Inventory.Open();
+  except
+    Logger.Warn('Could not read the levels: ' + GetExceptionMessage());
+  end;
+
+  FisherForm.Init();
+  SetClientInputLocked(True);
+  try
+    Fisher.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

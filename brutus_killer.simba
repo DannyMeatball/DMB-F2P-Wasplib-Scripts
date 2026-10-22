@@ -1,0 +1,2818 @@
+{$I WaspLib/main.simba}
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// Brutus (Lumbridge cow boss) killer for Simba 2.0 + current WaspLib.
+// Start it anywhere: within 60 tiles of Brutus's pen gate it walks there; further away (or if
+// the walk fails) it teleports with the cowbell amulet first. Then it clicks Release on the
+// gate (WaspLib's gate). Started in the arena with his health bar up, it just fights.
+// Known spots (WaspLib places us in the arena): the home spot west of his spawn (HOME_X/Y), the
+// fence as a box (ARENA_X1..Y2) and the gate (GATE_X/Y). The minimap colour methods are only a
+// backup for when WaspLib's position reading is poor.
+// Have food in the inventory, and the client in the Fixed - Classic layout (the boss health bar
+// is read at fixed pixels).
+//
+//   - finds Brutus by his colours and attacks him (same idea as the cow script)
+//   - watches for his two special-attack warnings, which show as yellow overhead text:
+//         *growls*  = charge      *snorts*  = slam
+//     and sidesteps out of the way, then attacks again
+//   - eats whenever HP gets down to the "Eat at HP (%)" percentage (his specials hit up to
+//     ~19, so make sure that works out to 20 HP or more)
+//   - after each kill: buries the bones and picks up every stackable drop (coins, air / mind /
+//     chaos runes, iron arrows, scroll boxes) from its own pile, then waits for the respawn
+//   - after each kill (3-12 s after, once the drop has landed): rings the cowbell amulet so
+//     he spawns faster (settings tick-box, on). OSRS wiki: he normally respawns 36 ticks (21.6 s) after dying; "Ring" while he's
+//     still dead brings him 13 ticks (7.8 s) after the ring - but ringing close to his normal
+//     respawn can make it LONGER. So it rings once, as soon as he dies, never later than 12 s.
+//   - never runs antiban while a fight is going on
+//   - fights with whatever style you've set in the game: melee, ranged or magic
+//   - when the food runs out: teleports out with the cowbell amulet and logs out
+//   - same when the runes (magic: the runes you start with) or the ammo (ranged: the ammo
+//     slot) run out, or the game says "no ammo left" / "not enough ... runes"
+// No banking. The cowbell amulet (worn or in the inventory) is used to teleport out.
+
+type
+  EBrutusState = enum(
+    LOGIN,
+    LEVEL_UP,
+    OUT_OF_FOOD,
+    BURY,
+    LOOT,
+    MIDDLE,
+    FIGHT,
+    NO_ACTIVITY,
+    MAX_TIME
+  );
+
+  TBrutus = record
+    MaxTime: UInt64;        // milliseconds
+    EatPct: Integer;        // eat at or below this percentage of max HP (GUI)
+    EatAt: Integer;         // the same in HP points, worked out from EatPct at start
+    CombatStyle: Integer;   // 0 = leave as is, 1 = Attack, 2 = Strength, 3 = Defence, 4 = Controlled
+    AntibanSlowdown: Integer;
+    TankMode: Boolean;      // True = don't dodge, just eat through the specials
+    RingBell: Boolean;      // ring the cowbell amulet after each kill: Brutus comes back faster
+    LastRingAt, KillAt: UInt64;
+    RangSinceKill: Boolean;
+    SlamWait: Integer;      // ms to wait for another *snorts* after a sidestep (GUI)
+
+    State: EBrutusState;
+    Kills, BonesBuried, Charges, Slams: UInt64;
+    BuryAt: Integer;
+    NoBrutusCount: Integer;
+    PendingLoot: Boolean;   // True only right after our own kill
+    Loot: Boolean;          // GUI: pick up the drops (and bones) after each kill
+    MaxHP: Integer;
+    TeleCool: UInt64;       // ignore warnings until this time
+    AwaitClear: Boolean;    // after a dodge: ignore the old warning text until it has gone
+    NoFood: Boolean;        // True once the last food has been eaten
+    StartRunes: TStringArray;   // runes carried at the start (magic): one running out = stop
+    UsesAmmo: Boolean;          // ammo worn at the start (ranged): the slot emptying = stop
+    AmmoName: String;
+    NoSupplies: String;         // why we're out of runes / ammo ('' = fine)
+    SupplyCheckAt: UInt64;
+    NeedCenter: Boolean;    // True after a kill: walk to open ground before the next fight
+    Unsticks: UInt64;       // times we moved away from the fence
+    LastSeen: TPoint;       // where on the screen we last clicked him (used if his dot is hidden)
+  end;
+
+const
+  // Middle of the field, in tiles from Brutus's pen gate (east +, south +). Measure it with
+  // center_finder.simba while standing where you want to fight.
+  // (Only used if WaspLib can't place us in the arena - see HOME_X/HOME_Y below.)
+  CENTER_FROM_GATE_X = -6;
+  CENTER_FROM_GATE_Y = 10;
+  MAX_MIDDLE_TILES = 12;   // never walk further than this to get back to the middle
+
+  // KNOWN SPOTS (game tiles, your coordinate finder / test_brutus_position):
+  // where to stand and wait for Brutus - west of his spawn in the north-east of the pen
+  HOME_X = 3256;
+  HOME_Y = 3286;
+  // the area you can stand in inside the fence (from your run round the arena)
+  ARENA_X1 = 3245;
+  ARENA_X2 = 3265;
+  ARENA_Y1 = 3256;
+  ARENA_Y2 = 3293;
+  // the pen gate with "Release" (WaspLib's object data)
+  GATE_X = 3262;
+  GATE_Y = 3294;
+  MIN_SIMILARITY = 0.45;   // WaspLib position readings below this are ignored
+  NEAR_GATE_TILES = 60;    // closer than this to the pen gate at the start: walk, don't teleport
+
+  // Looting speed (milliseconds): hover before the right click, look at the menu, pause
+  // between items.
+  LOOT_HOVER_MIN = 250;
+  LOOT_HOVER_MAX = 600;
+  LOOT_READ_MIN = 300;
+  LOOT_READ_MAX = 750;
+  LOOT_GAP_MIN = 1200;
+  LOOT_GAP_MAX = 2200;
+
+  STEP_MIN_TILES = 3;   // slam sidestep: this many tiles, or one more (so 3 or 4)
+  DIAG_TILES = 5;       // charge: run this many tiles along BOTH axes (a true diagonal)
+
+  // Timings after a warning, in milliseconds from the moment the text appears.
+  // Change these if the log shows you still get hit.
+  CHARGE_HOLD = 1800;   // charge: step aside once, then attack again after this long
+
+var
+  // DEBUG (settings tick-box): the START checks (food, cowbell amulet) only warn, for testing
+  // the walking / start-up. The safety during fights (eating, escaping when out of food) stays.
+  DebugMode: Boolean;
+
+  FOODS: TItemArray = [
+    'Cooked chicken', 'Cooked meat', 'Bread', 'Cake', '2/3 cake', 'Slice of cake',
+    'Trout', 'Salmon', 'Tuna', 'Lobster', 'Swordfish', 'Monkfish', 'Shark',
+    'Sardine', 'Herring', 'Mackerel', 'Cod', 'Pike', 'Anglerfish', 'Manta ray',
+    'Chocolate cake', 'Meat pie', 'Apple pie', 'Redberry pie', 'Pizza', 'Plain pizza'
+  ];
+
+// ---------------------------------------------------------------- screen reading
+
+function BoneCount(): Integer;
+begin
+  Result := Inventory.Items.Count('Bull bones') + Inventory.Items.Count('Bones');
+end;
+
+// Where the boss health bar is. Fixed - Classic: its known pixels (tested). Other layouts
+// (resizable): the bar moves with the window size, so it is FOUND - the top middle of the game
+// view is scanned for the bar's pure green / red, and the flat strip they make is remembered.
+// (A guessed box there caught only part of the bar and called a kill while Brutus was alive.)
+var
+  FoundBar: TBox;
+  BarSearchAt: UInt64;
+
+function IsBarPixel(c: Integer): Boolean;
+var
+  r, g, b: Integer;
+begin
+  r := c and $FF;
+  g := (c shr 8) and $FF;
+  b := (c shr 16) and $FF;
+  Result := (b <= 30) and (((g >= 190) and (r <= 30)) or ((r >= 190) and (g <= 30)));
+end;
+
+// Look for the bar in the top middle of the game view. True + FoundBar when it's there.
+function FindBossBar(): Boolean;
+var
+  area, bar: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  x, y, n, rowHits, bestRow, bestHits, x1, x2, y1, y2: Integer;
+begin
+  area := MainScreen.Bounds;
+  area := Box(area.X1 + area.Width div 5, area.Y1, area.X2 - area.Width div 5, area.Y1 + area.Height div 3);
+  img := Target.GetImage(area);
+  mat := img.ToMatrix();
+
+  // the row with the most bar pixels...
+  bestRow := -1;
+  bestHits := 0;
+  for y := 0 to High(mat) do
+  begin
+    rowHits := 0;
+    for x := 0 to High(mat[y]) do
+      if IsBarPixel(mat[y][x]) then
+        Inc(rowHits);
+    if rowHits > bestHits then
+    begin
+      bestHits := rowHits;
+      bestRow := y;
+    end;
+  end;
+  if bestHits < 60 then
+    Exit;     // no bar-like strip (a bar is ~200 px wide)
+
+  // ...then how far the strip goes left/right on that row, and up/down
+  x1 := High(mat[bestRow]);
+  x2 := 0;
+  for x := 0 to High(mat[bestRow]) do
+    if IsBarPixel(mat[bestRow][x]) then
+    begin
+      x1 := Min(x1, x);
+      x2 := Max(x2, x);
+    end;
+  y1 := bestRow;
+  while (y1 > 0) and IsBarPixel(mat[y1 - 1][(x1 + x2) div 2]) do
+    Dec(y1);
+  y2 := bestRow;
+  while (y2 < High(mat)) and IsBarPixel(mat[y2 + 1][(x1 + x2) div 2]) do
+    Inc(y2);
+
+  // a health bar is wide and flat
+  if (x2 - x1 < 60) or (y2 - y1 > 30) then
+    Exit;
+  bar := Box(area.X1 + x1 - 2, area.Y1 + y1 - 2, area.X1 + x2 + 2, area.Y1 + y2 + 2);
+  if bar <> FoundBar then
+    Logger.Info('Boss bar found at ' + ToStr(bar) + ' (' + ToStr(x2 - x1 + 1) + ' x ' + ToStr(y2 - y1 + 1) + ' px).');
+  FoundBar := bar;
+  Result := True;
+end;
+
+function BossBarBox(): TBox;
+begin
+  if Client.Mode = EMode.FIXED then
+    Exit(Box(163, 48, 357, 64));
+  // not found yet (or the window changed): look again, at most every 1.5 s
+  if (FoundBar = Default(TBox)) and (GetTimeRunning() >= BarSearchAt) then
+  begin
+    BarSearchAt := GetTimeRunning() + 1500;
+    FindBossBar();
+  end;
+  Result := FoundBar;
+end;
+
+// The boss health bar (top middle of the game view, green over red) is on screen while we fight.
+// Returns the number of green pixels in it (0 = empty bar = Brutus is dead), or -1 if
+// there is no bar on the screen.
+function BossBarGreen(): Integer;
+var
+  bar: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  x, y, c, r, g, b, green, red: Integer;
+begin
+  Result := -1;
+
+  bar := BossBarBox();
+  if bar = Default(TBox) then
+    Exit;            // resizable: the bar hasn't been found on the screen (= no bar)
+  img := Target.GetImage(bar);
+  mat := img.ToMatrix();
+
+  for y := 0 to High(mat) do
+    for x := 0 to High(mat[y]) do
+    begin
+      c := mat[y][x];
+      r := c and $FF;
+      g := (c shr 8) and $FF;
+      b := (c shr 16) and $FF;
+
+      if (g >= 190) and (r <= 30) and (b <= 30) then
+        Inc(green)
+      else if (r >= 190) and (g <= 30) and (b <= 30) then
+        Inc(red);
+    end;
+
+  if green + red >= 300 then
+    Result := green;
+end;
+
+function BossBarVisible(): Boolean;
+begin
+  Result := BossBarGreen() >= 0;
+end;
+
+// A fight is going on: the bar is there and not empty
+function BossAlive(): Boolean;
+begin
+  Result := BossBarGreen() > 5;
+end;
+
+var
+  // Exact pixel shapes of his two warnings (yellow text, '#' = yellow pixel), cut from screenshots.
+  // Matching these means other yellow text (his moo, for example) is ignored.
+  SNORTS_TEXT: TStringArray = [
+    '...##....................................................##...',
+    '...##...................................##...............##...',
+    '########................................##............########',
+    '...##...................................##...............##...',
+    '..####.....#####..#####....####...####..####...#####....####..',
+    '.##..##...##......###.##..##..##..###...##....##.......##..##.',
+    '...........####...##..##..##..##..##....##.....####...........',
+    '..............##..##..##..##..##..##....##........##..........',
+    '..............##..##..##..##..##..##....##........##..........',
+    '..........#####...##..##...####...##.....###..#####...........'
+  ];
+
+  GROWLS_TEXT: TStringArray = [
+    '...##....................................##.............##...',
+    '...##....................................##.............##...',
+    '########.................................##..........########',
+    '...##....................................##.............##...',
+    '..####.....####...####...####...##...##..##...#####....####..',
+    '.##..##...##..##..###...##..##..##...##..##..##.......##..##.',
+    '..........##..##..##....##..##..##.#.##..##...####...........',
+    '..........##..##..##....##..##..#######..##......##..........',
+    '..........##..##..##....##..##..###.###..##......##..........',
+    '...........#####..##.....####....#...#...##..#####...........',
+    '..............##.............................................',
+    '..............##.............................................',
+    '..........##..##.............................................',
+    '...........####..............................................'
+  ];
+
+  LastIgnoredLog: UInt64;
+
+// 0..1: how much of the template's pixels are present in the yellow cluster `tpa`
+// (bounding box `bb`). 0 if the size is wrong or there are many extra pixels.
+function TextMatch(tpa: TPointArray; bb: TBox; tmpl: TStringArray): Double;
+var
+  grid: array of TBooleanArray;
+  i, x, y, w, h, bw, bh, hits, total: Integer;
+begin
+  h := Length(tmpl);
+  w := Length(tmpl[0]);
+  bw := bb.X2 - bb.X1 + 1;
+  bh := bb.Y2 - bb.Y1 + 1;
+
+  if (Abs(bw - w) > 1) or (Abs(bh - h) > 1) then
+    Exit(0);
+
+  SetLength(grid, bh);
+  for y := 0 to bh - 1 do
+    SetLength(grid[y], bw);
+
+  for i := 0 to High(tpa) do
+    grid[tpa[i].Y - bb.Y1][tpa[i].X - bb.X1] := True;
+
+  for y := 0 to h - 1 do
+    for x := 1 to w do
+      if tmpl[y][x] = '#' then
+      begin
+        Inc(total);
+        if (y < bh) and (x - 1 < bw) and grid[y][x - 1] then
+          Inc(hits);
+      end;
+
+  if total = 0 then
+    Exit(0);
+
+  if Length(tpa) > total * 1.15 + 3 then
+    Exit(0);
+
+  Result := hits / total;
+end;
+
+// Looks for Brutus's overhead warning: bright yellow text matching the exact shape of
+// "*growls*" or "*snorts*". Returns 0 = none, 1 = charge (*growls*), 2 = slam (*snorts*).
+function FindTelegraph(out textBox: TBox): Integer;
+var
+  bounds: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  tpa: TPointArray;
+  atpa: T2DPointArray;
+  bb: TBox;
+  x, y, c, r, g, b, i: Integer;
+begin
+  bounds := MainScreen.Bounds;
+  img := Target.GetImage(bounds);
+  mat := img.ToMatrix();
+
+  for y := 75 to High(mat) do      // the top rows hold the boss bar and XP counter
+    for x := 0 to High(mat[y]) do
+    begin
+      c := mat[y][x];
+      r := c and $FF;
+      g := (c shr 8) and $FF;
+      b := (c shr 16) and $FF;
+
+      if (r >= 240) and (g >= 240) and (b <= 40) then
+        tpa += Point(x + bounds.X1, y + bounds.Y1);
+    end;
+
+  if Length(tpa) < 100 then
+    Exit;
+
+  // tight clustering, so a yellow click marker next to the text can't merge with it
+  atpa := tpa.Cluster(4);
+  for i := 0 to High(atpa) do
+  begin
+    bb := atpa[i].Bounds();
+
+    if TextMatch(atpa[i], bb, GROWLS_TEXT) >= 0.9 then
+    begin
+      textBox := bb;
+      Exit(1);
+    end;
+
+    if TextMatch(atpa[i], bb, SNORTS_TEXT) >= 0.9 then
+    begin
+      textBox := bb;
+      Exit(2);
+    end;
+
+    // some other yellow text (his moo, say): ignored, but noted now and then
+    if (Length(atpa[i]) >= 25) and (GetTimeRunning() - LastIgnoredLog > 5000) then
+    begin
+      LastIgnoredLog := GetTimeRunning();
+      Logger.Info('Ignored yellow text: ' + ToStr(Length(atpa[i])) + ' px, ' + ToStr(bb.X2 - bb.X1 + 1) + 'x' + ToStr(bb.Y2 - bb.Y1 + 1) + '.');
+    end;
+  end;
+end;
+
+// Every pixel on the main screen with the dull grey / brown look of Brutus.
+// (Same rule as the cow script: low saturation, not too dark or bright, not bluish.)
+function FindGreyPixels(): TPointArray;
+var
+  bounds: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  x, y, c, r, g, b, mx, mn, count: Integer;
+begin
+  bounds := MainScreen.Bounds;
+  img := Target.GetImage(bounds);
+  mat := img.ToMatrix();
+
+  SetLength(Result, bounds.Width * bounds.Height);
+
+  for y := 0 to High(mat) do
+    for x := 0 to High(mat[y]) do
+    begin
+      if (x > bounds.Width - 135) and (y < 50) then
+        Continue;       // XP counter
+
+      c := mat[y][x];
+      r := c and $FF;
+      g := (c shr 8) and $FF;
+      b := (c shr 16) and $FF;
+
+      mx := Max(r, Max(g, b));
+      mn := Min(r, Min(g, b));
+
+      if (mx < 56) or (mx > 230) then
+        Continue;
+      if (mx - mn) * 100 >= 36 * mx then
+        Continue;
+      if b > r + 4 then
+        Continue;
+
+      Result[count] := Point(x + bounds.X1, y + bounds.Y1);
+      Inc(count);
+    end;
+
+  SetLength(Result, count);
+end;
+
+// Fence-coloured pixels (orange-brown wood: the pen's fence).
+// Hue 20-45, saturation at least 0.45, brightness 0.35-0.85 (checked against a screenshot).
+function FindFencePixels(): TPointArray;
+var
+  bounds: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  x, y, c, r, g, b, count: Integer;
+begin
+  bounds := MainScreen.Bounds;
+  img := Target.GetImage(bounds);
+  mat := img.ToMatrix();
+
+  SetLength(Result, bounds.Width * bounds.Height);
+
+  for y := 75 to High(mat) do
+    for x := 0 to High(mat[y]) do
+    begin
+      c := mat[y][x];
+      r := c and $FF;
+      g := (c shr 8) and $FF;
+      b := (c shr 16) and $FF;
+
+      if (r <= g) or (g < b) or (r < 90) or (r > 217) then
+        Continue;
+      if (r - b) * 100 < 45 * r then
+        Continue;
+      if ((g - b) * 60 < 20 * (r - b)) or ((g - b) * 60 > 45 * (r - b)) then
+        Continue;
+
+      Result[count] := Point(x + bounds.X1, y + bounds.Y1);
+      Inc(count);
+    end;
+
+  SetLength(Result, count);
+end;
+
+// Brutus's small health bar above his head: green + red, about 60 x 5 pixels (the player's
+// own bar is only 30 wide). Measured from screenshots. Returns its centre.
+function FindBrutusHPBar(out center: TPoint): Boolean;
+var
+  bounds, bb: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  tpa: TPointArray;
+  atpa: T2DPointArray;
+  x, y, c, r, g, b, i, w, h: Integer;
+begin
+  bounds := MainScreen.Bounds;
+  img := Target.GetImage(bounds);
+  mat := img.ToMatrix();
+
+  for y := 75 to High(mat) do          // the top rows hold the big boss bar
+    for x := 0 to High(mat[y]) do
+    begin
+      c := mat[y][x];
+      r := c and $FF;
+      g := (c shr 8) and $FF;
+      b := (c shr 16) and $FF;
+
+      if ((g >= 200) and (r <= 40) and (b <= 40)) or ((r >= 200) and (g <= 40) and (b <= 40)) then
+        tpa += Point(x + bounds.X1, y + bounds.Y1);
+    end;
+
+  if tpa = [] then
+    Exit;
+
+  atpa := tpa.Cluster(2);
+  for i := 0 to High(atpa) do
+  begin
+    bb := atpa[i].Bounds();
+    w := bb.X2 - bb.X1 + 1;
+    h := bb.Y2 - bb.Y1 + 1;
+
+    if (w >= 50) and (w <= 70) and (h >= 4) and (h <= 7) and (Length(atpa[i]) >= 200) then
+    begin
+      center := bb.Center;
+      Exit(True);
+    end;
+  end;
+end;
+
+// Item dots right next to the player (the drop from the kill we just made).
+function NearbyItemDots(): Integer;
+var
+  dots: TPointArray;
+  i: Integer;
+begin
+  dots := Minimap.GetDots(EDot.ITEM);
+  for i := 0 to High(dots) do
+    if dots[i].DistanceTo(Minimap.Center) <= 22 then
+      Inc(Result);
+end;
+
+// ---------------------------------------------------------------- setup
+
+function TBrutus.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    ToStr(Self.Kills),
+    FormatNumber(Self.Kills / Logger.TimeRunning.Elapsed * HOUR),
+    ToStr(Self.BonesBuried),
+    ToStr(Self.Charges) + ' / ' + ToStr(Self.Slams),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+procedure TBrutus.SlowAntiban();
+var
+  i: Integer;
+begin
+  if Self.AntibanSlowdown <= 1 then
+    Exit;
+
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * Self.AntibanSlowdown;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * Self.AntibanSlowdown;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+
+  Logger.Info('Antiban tasks slowed down ' + ToStr(Self.AntibanSlowdown) + 'x.');
+end;
+
+procedure TBrutus.SetCombatStyle();
+var
+  boxes: TBoxArray;
+  idx: Integer;
+  names: TStringArray;
+begin
+  if Self.CombatStyle = 0 then
+    Exit;
+
+  names := ['', 'Attack (accurate)', 'Strength (aggressive)', 'Defence (defensive)', 'Controlled'];
+
+  if not Combat.Open() then
+  begin
+    Logger.Warn('Could not open the Combat tab.');
+    Exit;
+  end;
+
+  boxes := Combat.StyleBoxes;
+
+  case Self.CombatStyle of
+    1: idx := 0;
+    2: idx := 1;
+    3: idx := High(boxes);
+    4: if Length(boxes) = 4 then idx := 2 else idx := -1;
+  end;
+
+  if (idx < 0) or (idx > High(boxes)) then
+  begin
+    Logger.Warn('This weapon has no ' + names[Self.CombatStyle] + ' style. Leaving the combat style alone.');
+    Exit;
+  end;
+
+  if Target.HasColor([$1D1F82, 0.560, EColorSpace.HSL, [1.403, 1.403, 0.196]], 1, boxes[idx]) then
+  begin
+    Logger.Info('Combat style already ' + names[Self.CombatStyle] + '.');
+    Exit;
+  end;
+
+  Mouse.Click(boxes[idx], EMouseButton.LEFT);
+
+  if SleepUntil(Target.HasColor([$1D1F82, 0.560, EColorSpace.HSL, [1.403, 1.403, 0.196]], 1, boxes[idx]), 200, 2000) then
+    Logger.Info('Combat style set to ' + names[Self.CombatStyle] + '.')
+  else
+    Logger.Warn('Clicked the ' + names[Self.CombatStyle] + ' style, but could not confirm it was selected.');
+
+  Inventory.Open();
+end;
+
+// First food item we are carrying, or '' if none
+function TBrutus.FindFood(): String;
+var
+  f: String;
+begin
+  for f in FOODS do
+    if Inventory.Items.Count(f) > 0 then
+      Exit(f);
+end;
+
+// Hovers the fence near the player until the text says "Release", then clicks it
+// (Release is the gate's left-click option).
+function ClickReleaseGate(): Boolean;
+var
+  fence, spots: TPointArray;
+  p, q, me: TPoint;
+  tooClose: Boolean;
+  dx, dy, checks: Integer;
+begin
+  me := MainScreen.Bounds.Center;
+  fence := FindFencePixels().SortFrom(me);
+
+  for p in fence do
+  begin
+    if p.DistanceTo(me) > 150 then
+      Break;                       // sorted by distance: everything after this is further
+
+    tooClose := False;
+    for q in spots do
+      if p.DistanceTo(q) < 10 then
+      begin
+        tooClose := True;
+        Break;
+      end;
+
+    if not tooClose then
+      spots += p;
+  end;
+
+  Logger.Info('Gate: checking ' + ToStr(Length(spots)) + ' spots on the fence around us.');
+
+  for p in spots do
+  begin
+    // the big boss health bar is up: we are already fighting in the arena
+    Inc(checks);
+    if (checks mod 4 = 0) and BossBarVisible() then
+      Exit(False);
+
+    Mouse.Move(p);
+    if MainScreen.IsUpText(['Release', 'Rele']) then
+    begin
+      Logger.Info('Gate: found it, releasing Brutus.');
+      Target.MouseClick(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+
+  // Backup: a grid of points around the player
+  Logger.Info('Gate: not on the fence spots, trying a grid around us.');
+  for dy := -4 to 4 do
+    for dx := -5 to 5 do
+    begin
+      p := Point(me.X + dx * 18, me.Y + dy * 16);
+      if not MainScreen.Bounds.Contains(p) then
+        Continue;
+
+      Inc(checks);
+      if (checks mod 4 = 0) and BossBarVisible() then
+        Exit(False);
+
+      Mouse.Move(p);
+      if MainScreen.IsUpText(['Release', 'Rele']) then
+      begin
+        Logger.Info('Gate: found it, releasing Brutus.');
+        Target.MouseClick(EMouseButton.LEFT);
+        Exit(True);
+      end;
+    end;
+end;
+
+// Already inside the fight? The boss bar is up, or there are hardly any NPCs around
+// (the open cow field is full of cows, the arena only has Brutus).
+// ---------------------------------------------------------------- known spots (WaspLib)
+
+var
+  ArenaMe: TPoint;          // our last good position (map pixels)
+  ArenaFixAt: UInt64;       // when it was read
+
+// Game tile -> WaspLib map pixels
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// Our position from WaspLib, only when the match is good and we're in or by the arena.
+function ArenaPos(out me: TPoint): Boolean;
+var
+  p: TPoint;
+  gx, gy: Integer;
+begin
+  p := Map.Position();
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  if Map.Similarity < MIN_SIMILARITY then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  if (gx < ARENA_X1 - 4) or (gx > ARENA_X2 + 4) or (gy < ARENA_Y1 - 4) or (gy > ARENA_Y2 + 4) then
+    Exit(False);
+  me := p;
+  ArenaMe := p;
+  ArenaFixAt := GetTimeRunning();
+  Result := True;
+end;
+
+// How many tiles a map point is from the nearest fence (the edge of the standable box);
+// negative = outside it.
+function TilesFromFence(p: TPoint): Double;
+var
+  gx, gy: Double;
+begin
+  gx := p.X / 4;
+  gy := (50430 - p.Y) / 4;
+  Result := Min(Min(gx - ARENA_X1, ARENA_X2 - gx), Min(gy - ARENA_Y1, ARENA_Y2 - gy));
+end;
+
+// Click the minimap towards a map point, at most `maxTiles` away.
+procedure ClickTowardsMap(me, dest: TPoint; maxTiles: Integer);
+var
+  mm: TPoint;
+  vx, vy, len: Double;
+begin
+  mm := TWalker.Point2MM(me, dest, Minimap.CompassRadians);
+  vx := mm.X - Minimap.Center.X;
+  vy := mm.Y - Minimap.Center.Y;
+  len := Sqrt(vx * vx + vy * vy);
+  if len > maxTiles * 4 then
+  begin
+    vx := vx / len * maxTiles * 4;
+    vy := vy / len * maxTiles * 4;
+  end;
+  Mouse.Click(Point(Minimap.Center.X + Round(vx) + Random(-1, 1), Minimap.Center.Y + Round(vy) + Random(-1, 1)), EMouseButton.LEFT);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if (bj = -1) or (best > maxTiles * RSTranslator.TILE_SIZE) then
+    Exit(False);
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Logger.Info('WaspLib object: "' + single.Name + '" at [' + ToStr(single.Coordinates[0].X) + ', ' +
+              ToStr(single.Coordinates[0].Y) + '].');
+  Result := True;
+end;
+
+// WaspLib's walker to `dest`, with long route steps filled in every 10 tiles (the minimap only
+// reaches ~15; a longer step can freeze the walker). True when we end within `reach` tiles.
+function WalkTo(dest: TPoint; reach: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  try
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / 40);
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: ' + GetExceptionMessage());
+  end;
+  Map.Walker.WaitMoving();
+  Result := Map.Position().DistanceTo(dest) <= reach * 4;
+end;
+
+// Where WaspLib places us, only if the match is good (up to 3 tries).
+function GoodPosition(out me: TPoint): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    me := Map.Position();
+    if ((me.X <> 0) or (me.Y <> 0)) and (Map.Similarity >= MIN_SIMILARITY) then
+      Exit(True);
+    Sleep(300, 500);
+  end;
+end;
+
+// From anywhere in the F2P area to just outside the pen gate (the side away from the arena).
+// True when we got there.
+function WalkToGate(): Boolean;
+var
+  outside: TPoint;
+  i: Integer;
+begin
+  outside := Tile(GATE_X, GATE_Y + 2);
+  if Map.Position().DistanceTo(outside) <= 3 * 4 then
+    Exit(True);
+  Logger.Info('Walk: to the pen gate (' + ToStr(Round(Map.Position().DistanceTo(outside) / 4)) + ' tiles).');
+  for i := 1 to 3 do
+    if WalkTo(outside, 3) then
+    begin
+      Logger.Info('Walk: at the pen gate.');
+      Exit(True);
+    end;
+  Logger.Warn('Walk: could not get to the pen gate from game (' + ToStr(Map.Position().X div 4) + ', ' +
+              ToStr((50430 - Map.Position().Y) div 4) + ').');
+end;
+
+function InArena(): Boolean;
+var
+  npcs, i: Integer;
+begin
+  // the big boss health bar: a few looks, so one odd frame can't fool us
+  for i := 1 to 3 do
+  begin
+    if BossBarVisible() then
+    begin
+      Logger.Info('Brutus''s health bar is up: we are in the arena.');
+      Exit(True);
+    end;
+    Sleep(150, 250);
+  end;
+
+  npcs := Length(Minimap.GetDots(EDot.NPC));
+  Logger.Info('NPC dots on the minimap: ' + ToStr(npcs) + '.');
+  Result := npcs <= 3;
+end;
+
+// Started outside the arena (standing next to Brutus's pen gate)? Click "Release" on the gate.
+function TBrutus.TeleportOut(): Boolean; forward;
+
+procedure TBrutus.EnterArena();
+var
+  attempt: Integer;
+  released: Boolean;
+  t: UInt64;
+  gate: TObject;
+  gateSpot, me: TPoint;
+  atGate: Boolean;
+  tiles: Integer;
+begin
+  // only Brutus's own health bar proves we're already in the arena (the NPC-dot guess
+  // doesn't: it said "in the arena" when we weren't)
+  if BossBarVisible() then
+  begin
+    Logger.Info('Brutus''s health bar is up: already in the arena. Skipping the gate.');
+    Exit;
+  end;
+
+  // Close to the pen gate: walk there. Too far, position unclear, or the walk fails: the
+  // cowbell amulet's teleport (it lands us by the cow field), then walk to the gate.
+  gateSpot := Tile(GATE_X, GATE_Y + 2);
+  atGate := False;
+  if GoodPosition(me) then
+  begin
+    tiles := Round(me.DistanceTo(gateSpot) / 4);
+    if tiles <= NEAR_GATE_TILES then
+    begin
+      Logger.Info('Start: ' + ToStr(tiles) + ' tiles from the pen gate - walking there.');
+      atGate := WalkToGate();
+      if not atGate then
+        Logger.Warn('Start: the walk to the gate failed - using the cowbell teleport instead.');
+    end
+    else
+      Logger.Info('Start: ' + ToStr(tiles) + ' tiles from the pen gate - too far to walk, using the cowbell teleport.');
+  end
+  else
+    Logger.Info('Start: WaspLib can''t place us clearly - using the cowbell teleport.');
+
+  if not atGate then
+  begin
+    if Self.TeleportOut() and
+       SleepUntil(Map.Position().DistanceTo(gateSpot) <= 40 * 4, 500, 15000) then
+      Logger.Info('Start: teleported, now ' + ToStr(Round(Map.Position().DistanceTo(gateSpot) / 4)) + ' tiles from the gate.')
+    else
+      Logger.Warn('Start: the teleport did not bring us near the pen - walking from here.');
+    Sleep(800, 1200);
+    atGate := WalkToGate();
+  end;
+  if not atGate then
+    Logger.Warn('Start: could not get to the pen gate - trying the gate from here anyway.');
+  Logger.Info('At the pen gate. Releasing Brutus.');
+
+  // the gate from WaspLib's object data (its "Release" option), at its known tile
+  if NearestObject(['Gate'], Tile(GATE_X, GATE_Y), 3, gate) then
+    try
+      released := gate.WalkInteract(['Release']);
+      if released then
+        Logger.Info('Gate: released Brutus (WaspLib''s gate).');
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+
+  for attempt := 1 to 3 do
+  begin
+    if released then
+      Break;
+    released := ClickReleaseGate();
+    if released then
+      Break;
+
+    if BossBarVisible() then
+    begin
+      Logger.Info('Brutus''s health bar is up: already in the arena. Stopping the gate search.');
+      Exit;
+    end;
+
+    Logger.Info('Gate not found, turning the camera.');
+    Antiban.LargeCameraRotation();
+  end;
+
+  if not released then
+  begin
+    Logger.Warn('Could not find the gate''s Release option. Start the script standing right next to the pen gate.');
+    Exit;
+  end;
+
+  Map.Walker.WaitMoving();
+
+  // There may be a confirmation ("Yes" / "Yes and don't ask again")
+  t := GetTimeRunning() + 8000;
+  while GetTimeRunning() < t do
+  begin
+    if Chat.Options.IndexOf('Yes') >= 0 then
+    begin
+      Logger.Info('Release dialog: ' + Chat.Options.ToString());
+      Chat.Options.Select('Yes');
+      Break;
+    end;
+
+    if Chat.ContainsContinue() then
+      Chat.Continue();
+
+    Sleep(300, 500);
+  end;
+
+  // wait until we are in the arena
+  if SleepUntil(InArena(), 500, 12000) then
+    Logger.Info('Brutus released, we are in the arena.')
+  else
+    Logger.Warn('Released the gate, but could not confirm we are in the arena. Carrying on.');
+end;
+
+procedure TBrutus.RememberSupplies(); forward;
+
+// How many charges the cowbell amulet has: its "Check" option, then the game's reply
+// "The amulet has 101 charges" (from your test). -1 = couldn't read it.
+function CowbellCharges(): Integer;
+var
+  amulet: TItem;
+  opt: TOption;
+  line, digits: String;
+  worn, picked: Boolean;
+  i: Integer;
+  endAt: UInt64;
+begin
+  Result := -1;
+  amulet := 'Cowbell amulet';
+  if Inventory.Open() and (Inventory.Items.Count(amulet) > 0) then
+    worn := False
+  else if Equipment.Open() and (Equipment.Items.Count(amulet) > 0) then
+    worn := True
+  else
+    Exit;
+
+  if worn then
+    picked := Equipment.Items.Hover(amulet)
+  else
+    picked := Inventory.Items.Hover(amulet);
+  if not picked then
+  begin
+    Inventory.Open();
+    Exit;
+  end;
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Inventory.Open();
+    Exit;
+  end;
+  Sleep(150, 300);
+
+  // the menu reader garbles letters: match the start of the line
+  picked := False;
+  for opt in ChooseOption.GetOptions() do
+    if Pos('che', Lowercase(opt.Text)) = 1 then
+    begin
+      ChooseOption.Select(opt);
+      picked := True;
+      Break;
+    end;
+  if not picked then
+  begin
+    if ChooseOption.IsOpen() then
+      ChooseOption.Close();
+    Inventory.Open();
+    Exit;
+  end;
+
+  // the reply in the chat: "The amulet has 101 charges"
+  endAt := GetTimeRunning() + 3000;
+  repeat
+    try
+      line := Lowercase(Chat.GetMessage(High(Chat.MessageLines)));
+    except
+      line := '';
+    end;
+    if Pos('charge', line) > 0 then
+    begin
+      if (Pos('no charge', line) > 0) or (Pos('not charged', line) > 0) then
+        Result := 0
+      else
+      begin
+        digits := '';
+        for i := 1 to Length(line) do
+          if (line[i] >= '0') and (line[i] <= '9') then
+            digits += line[i]
+          else if digits <> '' then
+            Break;
+        Result := StrToInt(digits, -1);
+      end;
+      Break;
+    end;
+    Sleep(200);
+  until GetTimeRunning() > endAt;
+  Inventory.Open();
+end;
+
+procedure TBrutus.Init();
+var
+  charges: Integer;
+begin
+  Logger.Setup('Brutus Killer');
+  ProgressReport.Setup(
+    'Brutus Killer',
+    ['Script runtime:', 'Kills:', 'Kills/H:', 'Bones buried:', 'Charges / slams:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+
+  StartListeners(300);
+
+  // the boss health bar: known pixels in Fixed - Classic; in other layouts it's looked for at the
+  // top middle of the game view (untested)
+  if Client.GetMode() = EMode.UNKNOWN then
+    Logger.Warn('Could not tell the game layout. Fixed - Classic is the tested one.')
+  else if Client.GetMode() <> EMode.FIXED then
+    Logger.Warn('Layout ' + ToStr(Client.GetMode()) + ': not tested yet (Fixed - Classic is). The boss health bar is ' +
+                'found by its colours at the top middle of the game view - the log says where.');
+
+  Antiban.Zoom.Min := 0;
+  Antiban.Zoom.Max := 30;
+  Antiban.Skills := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
+  Self.SlowAntiban();
+
+  // Brutus must be attackable with a plain left click
+  if Options.SetNPCAttack('Left-click where available') or Options.SetNPCAttack(2) then
+    Logger.Info('NPC attack option set to left-click.')
+  else
+    Logger.Warn('Could not change the NPC attack option. Set it to "Left-click where available" in Settings > Controls.');
+  Inventory.Open();
+
+  // the combat style is left as you set it (melee, ranged or magic all work)
+  Self.RememberSupplies();
+
+  Self.MaxHP := Stats.GetLevel(ESkill.HITPOINTS);
+  if Self.MaxHP < 10 then
+    Self.MaxHP := 10;
+
+  Logger.Info('Hitpoints level: ' + ToStr(Self.MaxHP) + ', current HP: ' + ToStr(Minimap.GetHPLevel()));
+  // percentage -> HP points, rounded up
+  Self.EatAt := Ceil(Self.MaxHP * Self.EatPct / 100);
+  Logger.Info('Eating at ' + ToStr(Self.EatPct) + ' pct = ' + ToStr(Self.EatAt) + ' HP or lower.');
+
+  if Self.EatAt < 20 then
+    Logger.Warn('That is below 20 HP: one special attack (up to ~19) could kill you from there. Raise the eat percentage.');
+
+  // Before anything else: food and the cowbell amulet (our way out) must be there
+  if Self.FindFood() = '' then
+  begin
+    if not DebugMode then
+      raise 'No food in the inventory. Bring some food and start again.';
+    Logger.Warn('DEBUG: no food in the inventory - carrying on (it will escape at low HP).');
+  end
+  else
+    Logger.Info('Food found: ' + Self.FindFood() + '.');
+
+  if Inventory.Items.Count('Cowbell amulet') > 0 then
+    Logger.Info('Cowbell amulet found in the inventory.')
+  else if Equipment.Open() and (Equipment.Items.Count('Cowbell amulet') > 0) then
+  begin
+    Logger.Info('Cowbell amulet found (worn).');
+    Inventory.Open();
+  end
+  else
+  begin
+    Inventory.Open();
+    if not DebugMode then
+      raise 'No cowbell amulet in the inventory or worn. It is needed to teleport out when the food runs out.';
+    Logger.Warn('DEBUG: no cowbell amulet - carrying on (no teleport to the arena or out of it).');
+  end;
+
+  // its charges (each teleport uses one; it's charged with air runes)
+  if (Inventory.Items.Count('Cowbell amulet') > 0) or
+     (Equipment.Open() and (Equipment.Items.Count('Cowbell amulet') > 0)) then
+  begin
+    charges := CowbellCharges();
+    if charges < 0 then
+      Logger.Warn('Cowbell amulet: could not read its charges - carrying on.')
+    else if charges = 0 then
+    begin
+      if not DebugMode then
+        raise 'The cowbell amulet has no charges. Charge it with air runes - it is the way out when the food runs out.';
+      Logger.Warn('DEBUG: the cowbell amulet has no charges - carrying on.');
+    end
+    else if charges < 5 then
+      Logger.Warn('Cowbell amulet: only ' + ToStr(charges) + ' charges left - charge it with air runes soon.')
+    else
+      Logger.Info('Cowbell amulet: ' + ToStr(charges) + ' charges.');
+  end;
+  Inventory.Open();
+
+  if Self.TankMode then
+    Logger.Info('Tank mode: the bot will not dodge, it just eats.')
+  else
+    Logger.Info('Dodging the charge (*growls*) and slam (*snorts*).');
+
+  Logger.Info('After a slam sidestep: waiting ' + ToStr(Self.SlamWait) + ' ms for another *snorts*.');
+
+  // WaspLib's map of Lumbridge and the cow fields: tested to place us in the arena too
+  // the whole F2P surface, so we can walk to the pen gate from anywhere
+  Logger.Info('Map: loading the F2P area (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(45, 55, 53, 48), 0)]);
+  if ArenaPos(ArenaMe) then
+    Logger.Info('Map: WaspLib places us at game (' + ToStr(ArenaMe.X div 4) + ', ' +
+                ToStr((50430 - ArenaMe.Y) div 4) + ') - using the known spots.')
+  else
+    Logger.Info('Map: not in/by the arena yet (or a poor match) - known spots used once we are.');
+
+  // Started outside? Release Brutus from his pen first.
+  Self.EnterArena();
+
+  Self.NeedCenter := True;
+  Self.BuryAt := Random(1, 3);
+end;
+
+// ---------------------------------------------------------------- health
+
+function TBrutus.Eat(food: String): Boolean;
+var
+  before: Integer;
+begin
+  before := Minimap.GetHPLevel();
+  Logger.Info('Eating ' + food + ' at ' + ToStr(before) + ' HP.');
+
+  if Inventory.Items.Interact(food, 'Eat') then
+    Result := SleepUntil(Minimap.GetHPLevel() > before, 80, 2000);
+end;
+
+// Eats if HP is at or below the limit. Returns False only when HP is low and there is no food.
+function TBrutus.CheckHP(): Boolean;
+var
+  cur, tries: Integer;
+  food: String;
+begin
+  Result := True;
+
+  for tries := 1 to 3 do
+  begin
+    cur := Minimap.GetHPLevel();
+
+    // unreadable orb: don't act on it
+    if (cur <= 0) or (cur > Self.MaxHP + 15) then
+      Exit;
+
+    if cur > Self.EatAt then
+      Exit;
+
+    food := Self.FindFood();
+    if food = '' then
+    begin
+      Logger.Warn('HP ' + ToStr(cur) + ' and no food left.');
+      Exit(False);
+    end;
+
+    Self.Eat(food);
+
+    if Self.FindFood() = '' then
+    begin
+      Self.NoFood := True;
+      Logger.Warn('That was the last food.');
+    end;
+  end;
+end;
+
+// ---- runes / ammo (magic / ranged): the combat style is left as you set it in the game
+
+// What you fight with: the runes in the inventory (magic) and ammo worn (ranged).
+procedure TBrutus.RememberSupplies();
+var
+  item: TItem;
+  names: TItemArray;
+  r: String;
+  have: Boolean;
+begin
+  Self.StartRunes := [];
+  Inventory.Open();
+  for item in Inventory.Items.RecognizeAll() do
+    if Pos(' rune', Lowercase(item)) > 0 then
+    begin
+      have := False;
+      for r in Self.StartRunes do
+        if SameText(r, item) then
+          have := True;
+      if not have then
+        Self.StartRunes += item;
+    end;
+
+  Self.UsesAmmo := False;
+  try
+    if Equipment.Open() then
+    begin
+      Self.UsesAmmo := Equipment.Slots.IsUsed(Ord(EEquipment.AMMO));
+      if Self.UsesAmmo then
+      begin
+        names := Equipment.Items.Recognize(Ord(EEquipment.AMMO));
+        if names <> [] then
+          Self.AmmoName := names[0];
+      end;
+    end;
+  except
+    Logger.Warn('Supplies: could not read the ammo slot: ' + GetExceptionMessage());
+  end;
+  Inventory.Open();
+
+  if Self.StartRunes <> [] then
+    Logger.Info('Supplies: runes ' + ToStr(Self.StartRunes) + ' - when one runs out it teleports out and logs out.');
+  if Self.UsesAmmo then
+    Logger.Info('Supplies: ammo worn (' + Self.AmmoName + ') - when it runs out it teleports out and logs out.');
+  if (Self.StartRunes = []) and not Self.UsesAmmo then
+    Logger.Info('Supplies: no runes or ammo - melee, nothing to run out of but food.');
+end;
+
+// The newest chat line, lower case.
+function BrutusChatLine(): String;
+begin
+  try
+    Result := Lowercase(Chat.GetMessage(High(Chat.MessageLines)));
+  except
+    Result := '';
+  end;
+end;
+
+// Out of runes or ammo? Cheap enough for the fight loop (the inventory is open anyway; the
+// worn ammo is read from the game's message). Every ~2 s. Sets NoSupplies with the reason.
+function TBrutus.SuppliesGone(): Boolean;
+var
+  r, line: String;
+begin
+  if Self.NoSupplies <> '' then
+    Exit(True);
+  if GetTimeRunning() < Self.SupplyCheckAt then
+    Exit;
+  Self.SupplyCheckAt := GetTimeRunning() + 2000;
+
+  line := BrutusChatLine();
+  if (Pos('no ammo left', line) > 0) or (Pos('no ammo', line) > 0) then
+    Self.NoSupplies := 'out of ammo (the game says: "' + line + '")'
+  else if (Pos('enough', line) > 0) and (Pos('rune', line) > 0) then
+    Self.NoSupplies := 'out of runes (the game says: "' + line + '")';
+
+  if Self.NoSupplies = '' then
+    for r in Self.StartRunes do
+      if Inventory.Items.Count(r) = 0 then
+      begin
+        Self.NoSupplies := 'out of ' + r + 's';
+        Break;
+      end;
+
+  Result := Self.NoSupplies <> '';
+  if Result then
+    Logger.Warn('Supplies: ' + Self.NoSupplies + ' - stopping the fight to teleport out.');
+end;
+
+// Between kills: is the ammo slot empty now? (Opens the equipment tab, then back.)
+procedure TBrutus.CheckAmmoSlot();
+begin
+  if (not Self.UsesAmmo) or (Self.NoSupplies <> '') then
+    Exit;
+  try
+    if Equipment.Open() and not Equipment.Slots.IsUsed(Ord(EEquipment.AMMO)) then
+    begin
+      Self.NoSupplies := 'out of ammo (the ammo slot is empty)';
+      Logger.Warn('Supplies: ' + Self.NoSupplies + ' - teleporting out.');
+    end;
+  except
+  end;
+  Inventory.Open();
+end;
+
+// Teleports out with the cowbell amulet (worn or in the inventory).
+// The menu options are logged, in case the teleport option is named differently than expected.
+function TBrutus.TeleportOut(): Boolean;
+var
+  amulet: TItem;
+  opt: TOption;
+  opts: String;
+  worn: Boolean;
+begin
+  amulet := 'Cowbell amulet';
+
+  if Inventory.Items.Count(amulet) > 0 then
+  begin
+    worn := False;
+    Inventory.Open();
+  end
+  else if Equipment.Open() and (Equipment.Items.Count(amulet) > 0) then
+    worn := True
+  else
+  begin
+    Logger.Warn('No cowbell amulet in the inventory or worn.');
+    Exit;
+  end;
+
+  if worn then
+    Result := Equipment.Items.Hover(amulet)
+  else
+    Result := Inventory.Items.Hover(amulet);
+
+  if not Result then
+  begin
+    Logger.Warn('Could not hover the cowbell amulet.');
+    Exit(False);
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+
+  for opt in ChooseOption.GetOptions() do
+    opts += '[' + opt.Text + '] ';
+  Logger.Info('Cowbell amulet menu: ' + opts);
+
+  Result := ChooseOption.Select(['Tele']);
+  if not Result then
+    Logger.Warn('No teleport option in the cowbell amulet menu.');
+end;
+
+// Rings the cowbell amulet (worn or in the inventory): Brutus spawns 7.8 s later instead of
+// 21.6 s after dying (OSRS wiki). The menu is logged if there's no Ring option.
+function TBrutus.RingCowbell(): Boolean;
+var
+  amulet: TItem;
+  opt: TOption;
+  opts: String;
+  worn: Boolean;
+begin
+  amulet := 'Cowbell amulet';
+  Self.LastRingAt := GetTimeRunning();
+
+  if Inventory.Items.Count(amulet) > 0 then
+  begin
+    worn := False;
+    Inventory.Open();
+  end
+  else if Equipment.Open() and (Equipment.Items.Count(amulet) > 0) then
+    worn := True
+  else
+  begin
+    Logger.Warn('Ring: no cowbell amulet in the inventory or worn.');
+    Exit;
+  end;
+
+  if worn then
+    Result := Equipment.Items.Hover(amulet)
+  else
+    Result := Inventory.Items.Hover(amulet);
+  if not Result then
+  begin
+    Logger.Warn('Ring: could not hover the cowbell amulet.');
+    Inventory.Open();
+    Exit(False);
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+  begin
+    Logger.Warn('Ring: the cowbell amulet menu did not open.');
+    Inventory.Open();
+    Exit(False);
+  end;
+  Sleep(100, 250);
+  for opt in ChooseOption.GetOptions() do
+    opts += '[' + opt.Text + '] ';
+
+  // the menu reader garbles letters ("Rin: Cowbell amulet"): match the start of the line
+  Result := False;
+  for opt in ChooseOption.GetOptions() do
+    if Pos('rin', Lowercase(opt.Text)) = 1 then
+    begin
+      ChooseOption.Select(opt);
+      Result := True;
+      Break;
+    end;
+  if Result then
+    Logger.Info('Ring: rang the cowbell amulet to bring Brutus back.')
+  else
+  begin
+    Logger.Warn('Ring: no Ring option in the cowbell amulet menu: ' + opts);
+    if ChooseOption.IsOpen() then
+      ChooseOption.Close();
+  end;
+  Sleep(400, 700);
+  Inventory.Open();                // back to the food
+end;
+
+// Ring once per kill, 3-12 s after it. Wiki: he respawns 7.8 s after a ring instead of 21.6 s
+// after dying, but a ring close to his normal respawn can make it longer - so never after 12 s.
+procedure TBrutus.RingIfDue();
+var
+  since: UInt64;
+begin
+  if (not Self.RingBell) or (Self.KillAt = 0) or Self.RangSinceKill then
+    Exit;
+  since := GetTimeRunning() - Self.KillAt;
+  if since < 3000 then
+    Exit;
+  if since >= 12000 then
+  begin
+    Logger.Info('Ring: too late to ring this time (' + ToStr(since div 1000) + ' s after the kill) - skipped.');
+    Self.RangSinceKill := True;
+    Exit;
+  end;
+  Self.RangSinceKill := Self.RingCowbell();
+end;
+
+// Teleports out with the cowbell amulet, then logs out.
+procedure TBrutus.Escape();
+var
+  tries: Integer;
+  before: TPoint;
+begin
+  Logger.Warn('Escaping from the arena with the cowbell amulet.');
+
+  before := Map.Position();
+  if Self.TeleportOut() then
+  begin
+    // wait for the teleport to finish, then check it really moved us
+    Sleep(4500, 6000);
+    if (before.X <> 0) and (Map.Position().DistanceTo(before) < 15 * RSTranslator.TILE_SIZE) then
+      Logger.Warn('The teleport did not move us - the cowbell amulet may be out of charges ' +
+                  '(it is charged with air runes). Logging out where we stand.')
+    else
+      Logger.Info('Teleport done.');
+  end
+  else
+    Logger.Warn('The teleport did not work. Logging out where we stand.');
+
+  // Logging out only works once combat has ended (about 10 s after the last hit)
+  for tries := 1 to 4 do
+  begin
+    if not Client.IsLoggedIn() then
+      Break;
+    if Logout.Logout() then
+      Break;
+    Sleep(2000, 3000);
+  end;
+end;
+
+procedure TBrutus.Emergency();
+begin
+  Logger.Warn('Out of food with low HP.');
+  Self.Escape();
+  raise 'Out of food at low HP. Script stopped.';
+end;
+
+// ---------------------------------------------------------------- fighting
+
+// Attack Brutus by tracking him: first by the little health bar above his head, otherwise by
+// his minimap dot (he is the only NPC in the arena). Project that onto the game view, take the big grey blob (his body)
+// nearest to it, check the hover text and click. A couple of hovers at most, no searching.
+function TBrutus.AttackBrutus(): Boolean;
+var
+  dots, tpa, cand: TPointArray;
+  atpa: T2DPointArray;
+  spot, mean, pt: TPoint;
+  box: TBox;
+  i, k, best: Integer;
+  d, bestDist, maxD: Double;
+  haveDot: Boolean;
+  bar: TPoint;
+begin
+  // 0. best: his own little health bar. His body is right under it (about 28 px lower).
+  if FindBrutusHPBar(bar) then
+    for k := 0 to 2 do
+    begin
+      pt := Point(bar.X + Random(-8, 8), bar.Y + 20 + k * 8 + Random(0, 4));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(['Attack Brutus', 'Brutus']) then
+      begin
+        Self.LastSeen := pt;
+        Target.MouseClick(EMouseButton.LEFT);
+        Exit(True);
+      end;
+    end;
+
+  // 1. otherwise: his minimap dot, else where we last saw him, else around us
+  dots := Minimap.GetDots(EDot.NPC);
+  best := -1;
+  bestDist := 60;
+  for i := 0 to High(dots) do
+  begin
+    d := dots[i].DistanceTo(Minimap.Center);
+    if d < bestDist then
+    begin
+      bestDist := d;
+      best := i;
+    end;
+  end;
+
+  haveDot := best >= 0;
+  if haveDot then
+  begin
+    box := Minimap.Vector2MSQuad([dots[best].X, dots[best].Y, 0], Minimap.CompassRadians, [2, 2]).Bounds;
+    spot := box.Center;
+  end
+  else if (Self.LastSeen.X <> 0) or (Self.LastSeen.Y <> 0) then
+    spot := Self.LastSeen
+  else
+    spot := MainScreen.Bounds.Center;
+
+  // 2. his body: the big grey blob closest to that spot
+  tpa := FindGreyPixels();
+  if tpa <> [] then
+  begin
+    atpa := tpa.Cluster(8).ExcludeSize(300, __LT__).SortFrom(spot);
+
+    for i := 0 to Min(High(atpa), 1) do
+    begin
+      mean := atpa[i].Mean();
+      maxD := 0;
+      for k := 0 to High(atpa[i]) do
+        maxD := Max(maxD, atpa[i][k].DistanceTo(mean));
+
+      cand := [];
+      for k := 0 to High(atpa[i]) do
+        if atpa[i][k].DistanceTo(mean) <= maxD * 0.5 then
+          cand += atpa[i][k];
+
+      if cand = [] then
+        pt := mean
+      else
+        pt := cand[Random(Length(cand))];
+
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(['Attack Brutus', 'Brutus']) then
+      begin
+        Self.LastSeen := pt;
+        Target.MouseClick(EMouseButton.LEFT);
+        Exit(True);
+      end;
+    end;
+  end;
+
+  // 3. backup: just above his tile (he stands on it, so his body is a little higher)
+  if haveDot then
+    for k := 0 to 2 do
+    begin
+      pt := Point(spot.X + Random(-6, 6), spot.Y - 10 - k * 12);
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(['Attack Brutus', 'Brutus']) then
+      begin
+        Self.LastSeen := pt;
+        Target.MouseClick(EMouseButton.LEFT);
+        Exit(True);
+      end;
+    end;
+
+  Logger.Info('Could not click Brutus this time.');
+end;
+
+// Click the minimap to get out of the way. Slam (diagonal = False): 3 or 4 tiles sideways of
+// the line between us and Brutus. Charge (diagonal = True): 5 tiles diagonally away from
+// him, so we end up well off his charge line.
+// The fences show on the minimap as thin white lines (colour 233,244,245 in the screenshots).
+// Returns those pixels (our own white dot in the very centre is left out).
+function MinimapFence(): TPointArray;
+var
+  c, p: TPoint;
+  area: TBox;
+  img: TImage;
+  mat: TIntegerMatrix;
+  x, y, col, r, g, b: Integer;
+  d: Double;
+begin
+  c := Minimap.Center;
+  area := Box(c.X - 70, c.Y - 70, c.X + 70, c.Y + 70);
+  img := Target.GetImage(area);
+  mat := img.ToMatrix();
+
+  for y := 0 to High(mat) do
+    for x := 0 to High(mat[y]) do
+    begin
+      col := mat[y][x];
+      r := col and $FF;
+      g := (col shr 8) and $FF;
+      b := (col shr 16) and $FF;
+      if (r >= 220) and (g >= 220) and (b >= 220) then
+      begin
+        p := Point(x + area.X1, y + area.Y1);
+        d := p.DistanceTo(c);
+        if (d > 4) and (d <= 68) then
+          Result += p;
+      end;
+    end;
+end;
+
+function CountNear(tpa: TPointArray; p: TPoint; radius: Double): Integer;
+var
+  q: TPoint;
+begin
+  for q in tpa do
+    if q.DistanceTo(p) <= radius then
+      Inc(Result);
+end;
+
+// How bad a minimap destination is: fence close to where we would end up, and fence on the
+// way there.
+function FenceScore(fence: TPointArray; dest: TPoint): Integer;
+var
+  c, mid, pDest, pMid: TPoint;
+  tf: Double;
+begin
+  // known spots (position read in the last 2 s): how close the landing spot and the way there
+  // come to the fence box. 0 = well inside.
+  if (ArenaFixAt > 0) and (GetTimeRunning() - ArenaFixAt < 2000) then
+  begin
+    c := Minimap.Center;
+    pDest := Map.Walker.MM2Map(ArenaMe, dest, Minimap.CompassRadians);
+    pMid := Map.Walker.MM2Map(ArenaMe, Point((c.X + dest.X) div 2, (c.Y + dest.Y) div 2), Minimap.CompassRadians);
+    tf := TilesFromFence(pDest);
+    if tf < 2 then
+      Result += Round((2 - tf) * 10);
+    tf := TilesFromFence(pMid);
+    if tf < 1 then
+      Result += Round((1 - tf) * 5);
+    Exit;
+  end;
+
+  c := Minimap.Center;
+  mid := Point((c.X + dest.X) div 2, (c.Y + dest.Y) div 2);
+  Result := CountNear(fence, dest, 8) * 2 + CountNear(fence, mid, 6);
+end;
+
+procedure TBrutus.StepAside(textBox: TBox; diagonal: Boolean);
+var
+  dots: TPointArray;
+  c, dest: TPoint;
+  vx, vy, len, px, py, d, best, speed: Double;
+  i, tiles, pick, nOk: Integer;
+  ax, ay, sgn, dot, bestDot: Double;
+  dsx, dsy: TIntegerArray;
+  fence: TPointArray;
+  cand: TPoint;
+  score, bestScore: Integer;
+begin
+  ArenaPos(c);               // fresh known position for FenceScore (c is set again below)
+  c := Minimap.Center;
+  fence := MinimapFence();
+  dots := Minimap.GetDots(EDot.NPC);
+  best := 1000000;
+  for i := 0 to High(dots) do
+  begin
+    d := dots[i].DistanceTo(c);
+    if d < best then
+    begin
+      best := d;
+      vx := dots[i].X - c.X;
+      vy := dots[i].Y - c.Y;
+    end;
+  end;
+
+  if best > 40 then
+  begin
+    // no dot: use the text position relative to the player (screen centre)
+    vx := textBox.Center.X - MainScreen.Bounds.Center.X;
+    vy := textBox.Y2 + 20 - MainScreen.Bounds.Center.Y;
+  end;
+
+  len := Sqrt(vx * vx + vy * vy);
+  if len < 0.5 then
+  begin
+    vx := 1;
+    vy := 0;
+    len := 1;
+  end;
+
+  if Random(2) = 0 then
+    sgn := 1
+  else
+    sgn := -1;
+
+  if diagonal then
+  begin
+    // Always one of the four true diagonals (NE, NW, SE, SW on the screen). Take the ones that
+    // leave his charge line: not straight away from him (that is still on the line) and not
+    // towards him. Pick one of those at random.
+    ax := -vx / len;
+    ay := -vy / len;
+
+    dsx := [1, 1, -1, -1];
+    dsy := [1, -1, 1, -1];
+    bestDot := 100;
+    pick := -1;
+    nOk := 0;
+
+    bestScore := 1000000;
+    for i := 0 to 3 do
+    begin
+      dot := (ax * dsx[i] + ay * dsy[i]) * 0.7071;
+      if (dot <= 0.8) and (dot >= -0.1) then
+      begin
+        // the one with the least fence in the way; equal ones are picked at random
+        cand := Point(c.X + dsx[i] * DIAG_TILES * 4, c.Y + dsy[i] * DIAG_TILES * 4);
+        score := FenceScore(fence, cand);
+        if score < bestScore then
+        begin
+          bestScore := score;
+          pick := i;
+          nOk := 1;
+        end
+        else if score = bestScore then
+        begin
+          Inc(nOk);
+          if Random(nOk) = 0 then
+            pick := i;
+        end;
+      end;
+    end;
+
+    if pick < 0 then
+    begin
+      // should not happen, but never stand still: take the diagonal closest to "away"
+      best := -100;
+      for i := 0 to 3 do
+      begin
+        dot := (ax * dsx[i] + ay * dsy[i]) * 0.7071;
+        if dot > best then
+        begin
+          best := dot;
+          pick := i;
+        end;
+      end;
+    end;
+
+    // DIAG_TILES tiles along each axis, 4 minimap pixels per tile
+    dest := Point(c.X + dsx[pick] * DIAG_TILES * 4 + Random(-1, 1), c.Y + dsy[pick] * DIAG_TILES * 4 + Random(-1, 1));
+  end
+  else
+  begin
+    // perpendicular to the line between us and Brutus, 3 or 4 tiles (4 minimap pixels per tile)
+    px := -vy / len * sgn;
+    py := vx / len * sgn;
+    tiles := STEP_MIN_TILES + Random(2);
+
+    // the other side if it has less fence in the way
+    cand := Point(c.X + Round(px * tiles * 4), c.Y + Round(py * tiles * 4));
+    dest := Point(c.X - Round(px * tiles * 4), c.Y - Round(py * tiles * 4));
+    if FenceScore(fence, dest) < FenceScore(fence, cand) then
+    begin
+      px := -px;
+      py := -py;
+    end;
+
+    dest := Point(c.X + Round(px * tiles * 4) + Random(-1, 1), c.Y + Round(py * tiles * 4) + Random(-1, 1));
+  end;
+
+  speed := Target.Options.MouseSpeed;
+  Target.Options.MouseSpeed := Max(speed, 22.0);
+  Mouse.Click(dest, EMouseButton.LEFT);
+  Target.Options.MouseSpeed := speed;
+end;
+
+// Waits until `untilMs` after `t0`, watching health and for a NEW warning (the old text
+// disappears first). Returns the new warning's kind (1 or 2), or 0 if none came.
+function TBrutus.WaitForWarning(t0, untilMs: UInt64; var textGone: Boolean; out textBox: TBox): Integer;
+var
+  nextHP: UInt64;
+  kind: Integer;
+begin
+  nextHP := 0;
+
+  while GetTimeRunning() - t0 < untilMs do
+  begin
+    if GetTimeRunning() >= nextHP then
+    begin
+      nextHP := GetTimeRunning() + 900;
+      if not Self.CheckHP() then
+        Self.Emergency();
+    end;
+
+    kind := FindTelegraph(textBox);
+    if kind = 0 then
+      textGone := True
+    else if textGone then
+      Exit(kind);
+
+    Sleep(60, 100);
+  end;
+end;
+
+// Steps out of the way of a special attack, then attacks again.
+// kind: 1 = charge (one step), 2 = slam (he slams up to 3 times: step aside for each).
+// Fence within ~3 tiles of us on the minimap?
+function FenceNearMe(): Boolean;
+var
+  me: TPoint;
+begin
+  // known spots: within 2 tiles of the arena's edge
+  if ArenaPos(me) then
+    Exit(TilesFromFence(me) <= 2);
+  Result := CountNear(MinimapFence(), Minimap.Center, 12) >= 3;
+end;
+
+// Stuck against the fence: walk 6 tiles straight away from it, then hit him again.
+procedure TBrutus.Unstick(reason: String);
+var
+  fence, near: TPointArray;
+  c, m, me: TPoint;
+  vx, vy, len: Double;
+begin
+  // known spots: step 6 tiles towards the home spot (always away from the fence)
+  if ArenaPos(me) then
+  begin
+    Logger.Warn('Stuck at the fence (' + reason + '). Stepping towards the home spot.');
+    Inc(Self.Unsticks);
+    ClickTowardsMap(me, Tile(HOME_X, HOME_Y), 6);
+    Sleep(400, 600);
+    Map.Walker.WaitMoving();
+    if BossAlive() then
+      Self.AttackBrutus();
+    Exit;
+  end;
+
+  c := Minimap.Center;
+  fence := MinimapFence();
+  for m in fence do
+    if m.DistanceTo(c) <= 16 then
+      near += m;
+
+  if Length(near) < 3 then
+    Exit;
+
+  m := near.Mean();
+  vx := c.X - m.X;
+  vy := c.Y - m.Y;
+  len := Sqrt(vx * vx + vy * vy);
+  if len < 0.5 then
+    Exit;
+
+  Logger.Warn('Stuck at the fence (' + reason + '). Moving away from it.');
+  Inc(Self.Unsticks);
+  Mouse.Click(Point(c.X + Round(vx / len * 24), c.Y + Round(vy / len * 24)), EMouseButton.LEFT);
+  Sleep(400, 600);
+  Map.Walker.WaitMoving();
+
+  if BossAlive() then
+    Self.AttackBrutus();
+end;
+
+procedure TBrutus.Dodge(kind: Integer; textBox: TBox);
+var
+  hpBefore, hpAfter, newKind, slams: Integer;
+  t0: UInt64;
+  textGone: Boolean;
+begin
+  if kind = 1 then
+  begin
+    Inc(Self.Charges);
+    Logger.Info('*growls*: charge coming, stepping aside.');
+  end
+  else
+  begin
+    Inc(Self.Slams);
+    Logger.Info('*snorts*: slam coming, stepping aside.');
+  end;
+
+  hpBefore := Minimap.GetHPLevel();
+  t0 := GetTimeRunning();
+  textGone := False;
+
+  Self.StepAside(textBox, kind = 1);
+
+  if kind = 1 then
+  begin
+    newKind := Self.WaitForWarning(t0, CHARGE_HOLD, textGone, textBox);
+    if newKind > 0 then
+    begin
+      Self.Dodge(newKind, textBox);
+      Exit;
+    end;
+  end
+  else
+  begin
+    // A slam does not always come in threes. Each one shows its own *snorts*: step aside,
+    // wait a moment to see whether another follows, and attack again if none does.
+    slams := 1;
+    repeat
+      newKind := Self.WaitForWarning(t0, Self.SlamWait, textGone, textBox);
+
+      if newKind = 1 then
+      begin
+        Self.Dodge(1, textBox);
+        Exit;
+      end;
+
+      if (newKind = 2) and (slams < 8) then
+      begin
+        Inc(slams);
+        Inc(Self.Slams);
+        Logger.Info('*snorts* again (slam ' + ToStr(slams) + '): stepping aside.');
+        Self.StepAside(textBox, False);
+        t0 := GetTimeRunning();
+        textGone := False;
+      end
+      else
+        Break;
+    until False;
+  end;
+
+  hpAfter := Minimap.GetHPLevel();
+  Logger.Info('Special over after ' + ToStr(GetTimeRunning() - t0) + ' ms. HP ' + ToStr(hpBefore) + ' -> ' + ToStr(hpAfter));
+
+  // the special hit us even though we dodged: probably pinned against the fence
+  if (hpBefore > 0) and (hpAfter > 0) and (hpBefore - hpAfter >= 8) and FenceNearMe() then
+  begin
+    Self.AwaitClear := True;
+    Self.Unstick('a special hit us for ' + ToStr(hpBefore - hpAfter));
+    Exit;
+  end;
+
+  // The warning text lingers for a few seconds: don't dodge it a second time while it fades
+  Self.AwaitClear := True;
+  Self.TeleCool := GetTimeRunning() + 800;
+  Activity.Restart();
+
+  // walking away cancels the attack, so click him again (only while his bar is up)
+  if BossAlive() then
+    Self.AttackBrutus();
+end;
+
+// The pen gate shows on the minimap as a short thin red line (a door). Measured from
+// screenshots: about 8 red pixels in a line 6-8 pixels long. Item dots and the walk flag
+// are red too, but they are small blobs, not thin lines.
+function FindGateMarkers(): TPointArray;
+var
+  c, p: TPoint;
+  img: TImage;
+  mat: TIntegerMatrix;
+  tpa: TPointArray;
+  atpa: T2DPointArray;
+  bb, area: TBox;
+  x, y, col, r, g, b, i, n, longest: Integer;
+begin
+  c := Minimap.Center;
+  area := Box(c.X - 70, c.Y - 70, c.X + 70, c.Y + 70);
+  img := Target.GetImage(area);
+  mat := img.ToMatrix();
+
+  for y := 0 to High(mat) do
+    for x := 0 to High(mat[y]) do
+    begin
+      col := mat[y][x];
+      r := col and $FF;
+      g := (col shr 8) and $FF;
+      b := (col shr 16) and $FF;
+      if (r >= 180) and (g <= 60) and (b <= 60) then
+      begin
+        p := Point(x + area.X1, y + area.Y1);
+        if p.DistanceTo(c) <= 68 then
+          tpa += p;
+      end;
+    end;
+
+  if tpa = [] then
+    Exit;
+
+  atpa := tpa.Cluster(2);
+  for i := 0 to High(atpa) do
+  begin
+    bb := atpa[i].Bounds();
+    n := Length(atpa[i]);
+    longest := Max(bb.X2 - bb.X1, bb.Y2 - bb.Y1) + 1;
+
+    if (longest >= 6) and (n >= 5) and (n <= 16) and (n * 10 <= longest * 16) then
+      Result += atpa[i].Mean();
+  end;
+end;
+
+// After a kill: walk back to the middle of the field, measured from the pen gate on the
+// minimap (CENTER_FROM_GATE_X / _Y tiles). Short hops, at most 3, no fence guessing.
+procedure TBrutus.MoveToOpenGround();
+var
+  gates: TPointArray;
+  dest, best, c, me, home: TPoint;
+  hop, i: Integer;
+  vx, vy, d, bestD: Double;
+begin
+  // known spots: walk to the home spot (west of his spawn), a few short hops
+  home := Tile(HOME_X, HOME_Y);
+  if ArenaPos(me) then
+  begin
+    for hop := 1 to 4 do
+    begin
+      d := me.DistanceTo(home) / 4;
+      if d <= 1.5 then
+      begin
+        Logger.Info('Home: at the home spot.');
+        Exit;
+      end;
+      Logger.Info('Home: walking to the home spot (' + ToStr(Round(d)) + ' tiles).');
+      ClickTowardsMap(me, home, 14);
+      Sleep(500, 800);
+      Map.Walker.WaitMoving();
+      if not ArenaPos(me) then
+        Break;
+    end;
+    Exit;
+  end;
+
+  c := Minimap.Center;
+
+  for hop := 1 to 2 do
+  begin
+    gates := FindGateMarkers();
+    if gates = [] then
+    begin
+      Logger.Info('Middle: pen gate not on the minimap, staying here.');
+      Exit;
+    end;
+
+    // Other doors also show as red lines. Use the one that puts the middle closest to us:
+    // that way a wrong red line can never send us across the field.
+    bestD := 1000000;
+    for i := 0 to High(gates) do
+    begin
+      dest := Point(gates[i].X + CENTER_FROM_GATE_X * 4, gates[i].Y + CENTER_FROM_GATE_Y * 4).Rotate(Minimap.CompassRadians, gates[i]);
+      d := dest.DistanceTo(c);
+      if d < bestD then
+      begin
+        bestD := d;
+        best := dest;
+      end;
+    end;
+
+    if bestD <= 8 then
+    begin
+      Logger.Info('Middle: in the middle of the field.');
+      Exit;
+    end;
+
+    // never a long run: more than ~12 tiles means something was misread
+    if bestD > MAX_MIDDLE_TILES * 4 then
+    begin
+      Logger.Info('Middle: the middle looks ' + ToStr(Round(bestD / 4)) + ' tiles away, too far to trust. Staying here.');
+      Exit;
+    end;
+
+    vx := best.X - c.X;
+    vy := best.Y - c.Y;
+
+    Logger.Info('Middle: walking to the middle (' + ToStr(Round(bestD / 4)) + ' tiles).');
+    Mouse.Click(Point(c.X + Round(vx), c.Y + Round(vy)), EMouseButton.LEFT);
+    Sleep(500, 800);
+    Map.Walker.WaitMoving();
+  end;
+end;
+
+// Stand still and let Brutus come to us: he walks up (or charges) and attacks, and his big
+// health bar appears. No searching for him on the screen while the bar is gone (he is dead or
+// respawning). Dodges specials while waiting. True once the bar is up.
+function TBrutus.WaitForBrutus(): Boolean;
+var
+  kind, loops: Integer;
+  textBox: TBox;
+  t: UInt64;
+begin
+  Logger.Info('Waiting for Brutus to come to us.');
+  t := GetTimeRunning() + 45000;
+
+  while GetTimeRunning() < t do
+  begin
+    if BossAlive() then
+    begin
+      Logger.Info('Brutus''s health bar is up: fight on.');
+      Exit(True);
+    end;
+
+    if not Self.TankMode then
+    begin
+      kind := FindTelegraph(textBox);
+      if kind = 0 then
+        Self.AwaitClear := False
+      else if not Self.AwaitClear then
+      begin
+        Self.Dodge(kind, textBox);
+        Continue;
+      end;
+    end;
+
+    Inc(loops);
+    if loops mod 5 = 0 then
+      if not Self.CheckHP() then
+        Self.Emergency();
+
+    if Self.NoFood or Self.SuppliesGone() then
+      Exit;
+
+    // not rung yet since the kill? 3-12 s after it: not while he's still dying, and not later
+    // than 12 s - later it can delay him instead (OSRS wiki)
+    Self.RingIfDue();
+
+    Activity.Restart();
+    Sleep(150, 250);
+  end;
+end;
+
+// Click Brutus and fight until he is dead.
+procedure TBrutus.Fight();
+var
+  seenBar: Boolean;
+  idle, itemsBefore, kind, green, deadLooks: Integer;
+  textBox: TBox;
+  endAt, nextHP, winStart: UInt64;
+  hpNow, winHP: Integer;
+begin
+  // Let him come to us in the middle of the pen. Only once his health bar is up do we look
+  // for him on the screen.
+  if not BossAlive() then
+    if not Self.WaitForBrutus() then
+    begin
+      if Self.NoFood then
+        Exit;
+
+      Inc(Self.NoBrutusCount);
+      Logger.Info('Brutus has not come yet (' + ToStr(Self.NoBrutusCount) + '). Still waiting.');
+
+      if Self.NoBrutusCount >= 5 then
+        raise 'Brutus never showed up. Stand in the arena with him released and start again.';
+      Exit;
+    end;
+
+  Self.NoBrutusCount := 0;
+
+  // hit back (auto-retaliate may already be doing it)
+  Self.AttackBrutus();
+  Map.Walker.WaitMoving();
+
+  seenBar := False;
+  idle := 0;
+  deadLooks := 0;
+  itemsBefore := NearbyItemDots();
+  nextHP := 0;
+  winHP := 0;
+  winStart := 0;
+  endAt := GetTimeRunning() + 5 * MINUTE;
+
+  while GetTimeRunning() < endAt do
+  begin
+    // 0. out of food / runes / ammo: stop fighting, the main loop escapes
+    if Self.NoFood or Self.SuppliesGone() then
+      Break;
+
+    // 1. special attack warning
+    if not Self.TankMode then
+    begin
+      kind := FindTelegraph(textBox);
+      if kind = 0 then
+        Self.AwaitClear := False
+      else if (not Self.AwaitClear) and (GetTimeRunning() >= Self.TeleCool) then
+      begin
+        Self.Dodge(kind, textBox);
+        idle := 0;
+        deadLooks := 0;
+        itemsBefore := NearbyItemDots();
+        Continue;
+      end;
+    end;
+
+    // 2. health
+    if GetTimeRunning() >= nextHP then
+    begin
+      nextHP := GetTimeRunning() + 900;
+
+      // Losing a lot of HP in a few seconds while next to the fence: we are stuck there.
+      // (Counted before eating, so food doesn't hide it.)
+      hpNow := Minimap.GetHPLevel();
+      if hpNow > 0 then
+      begin
+        if (winHP <= 0) or (GetTimeRunning() - winStart > 6000) or (hpNow > winHP) then
+        begin
+          winHP := hpNow;
+          winStart := GetTimeRunning();
+        end
+        else if (winHP - hpNow >= 12) and FenceNearMe() then
+        begin
+          Self.Unstick('lost ' + ToStr(winHP - hpNow) + ' HP in a few seconds');
+          winHP := 0;
+          idle := 0;
+        end;
+      end;
+
+      if not Self.CheckHP() then
+        Self.Emergency();
+    end;
+
+    // 3. is the fight still going?
+    green := BossBarGreen();
+    if green >= 0 then
+    begin
+      seenBar := True;
+      idle := 0;
+      Activity.Restart();
+
+      // an empty bar means he is dead (two looks in a row, so one odd frame can't fool us)
+      if green <= 5 then
+        Inc(deadLooks)
+      else
+        deadLooks := 0;
+
+      if deadLooks >= 2 then
+      begin
+        Logger.Info('Boss bar is empty: Brutus is dead.');
+        Break;
+      end;
+    end
+    else
+      Inc(idle);
+
+    // Dead as soon as the drop shows up next to us
+    // Old piles we left on the ground drift in and out of range as we dodge, so a new dot only
+    // counts as his drop when the boss bar is empty or gone as well.
+    if seenBar and (green <= 5) and (NearbyItemDots() > itemsBefore) then
+    begin
+      Logger.Info('A drop appeared next to us and the boss bar is empty: Brutus is dead.');
+      Break;
+    end;
+
+    // Or the bar has been gone for a while
+    // (no searching for him once the bar is gone: he is dead or the fight is over)
+    if (seenBar and (idle >= 12)) or ((not seenBar) and (idle >= 25)) then
+      Break;
+
+    Sleep(60, 110);
+  end;
+
+  // stopped because the food ran out, not because he died
+  if Self.NoFood then
+    Exit;
+
+  if seenBar then
+  begin
+    Inc(Self.Kills);
+    Self.KillAt := GetTimeRunning();
+    Self.RangSinceKill := False;
+    // the ring comes a little later (3-12 s after the kill: during looting, once the drop has
+    // landed, or while waiting) - rung the moment the bar empties it was too early
+    if Self.Loot then
+      Logger.Info('Kill #' + ToStr(Self.Kills) + '. Looting next.')
+    else
+      Logger.Info('Kill #' + ToStr(Self.Kills) + '. Looting is off.');
+    Self.PendingLoot := Self.Loot;
+    Self.NeedCenter := True;
+    Self.CheckAmmoSlot();
+  end
+  else
+    Logger.Info('Fight ended without his health bar ever showing: not counted as a kill, no loot.');
+end;
+
+// ---------------------------------------------------------------- loot
+
+// Pieces of the right-click options we want from the drop pile. Short pieces on purpose:
+// the menu reader sometimes misreads a letter ("Bur Bull bones", "Teleoort").
+var
+  LOOT_STACKABLES: TStringArray = [
+    'Coin',         // Coins
+    'Air r',        // Air rune
+    'Mind r',       // Mind rune
+    'Chaos r',      // Chaos rune
+    'Iron arr',     // Iron arrow
+    'croll'         // Scroll box / Clue scroll (beginner)
+  ];
+  LOOT_BONES: TStringArray = ['ull bon'];   // "Bury Bull bones"
+
+// The first option in the open menu matching one of `pieces` (never Examine / Walk / Cancel).
+function FindLootOption(pieces: TStringArray; out found: TOption): Boolean;
+var
+  opt: TOption;
+  piece: String;
+begin
+  for opt in ChooseOption.GetOptions() do
+  begin
+    if (Pos('xamine', opt.Text) > 0) or (Pos('Walk', opt.Text) > 0) or (Pos('Cancel', opt.Text) > 0) then
+      Continue;
+
+    for piece in pieces do
+      if Pos(piece, opt.Text) > 0 then
+      begin
+        found := opt;
+        Exit(True);
+      end;
+  end;
+end;
+
+// Screen point of the tile under a minimap point (our own tile when mm = Minimap.Center).
+function TileOnScreen(mm: TPoint): TPoint;
+begin
+  Result := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+end;
+
+// Loots our kill's pile: first every stackable (coins, runes, arrows, scroll box), one at a
+// time, then buries the bones. After the first pickup we are standing on the pile, so from
+// then on the pile is our own tile (its minimap dot hides under our own white dot).
+function TBrutus.LootPile(): Boolean;
+var
+  dots: TPointArray;
+  pile: TPoint;
+  opt, o: TOption;
+  opts: String;
+  pass, tryPile: Integer;
+  d: Double;
+  onPile, bonesDone, gotAny: Boolean;
+begin
+  // Give the drop time to appear before looking for it
+  Sleep(3800, 4200);
+
+  // he's surely dead now (the drop has landed): ring the cowbell for a quick respawn
+  Self.RingIfDue();
+
+  if not SleepUntil(Minimap.GetDots(EDot.ITEM) <> [], 150, 4000) then
+  begin
+    Logger.Info('Loot: no item dots appeared on the minimap.');
+    Exit;
+  end;
+
+  // Piles nearest first (up to ~16 tiles away). Leftover piles from earlier kills (steak,
+  // hide, logs we never take) are skipped: we only stop at a pile with something we want.
+  dots := Minimap.GetDots(EDot.ITEM);
+  dots := dots.SortFrom(Minimap.Center);
+  Logger.Info('Loot: ' + ToStr(Length(dots)) + ' item pile(s) on the minimap.');
+
+  // our own tile first: a pile we stand on hides under our own white minimap dot
+  dots := [Minimap.Center] + dots;
+
+  for tryPile := 0 to Min(High(dots), 5) do
+  begin
+    d := dots[tryPile].DistanceTo(Minimap.Center);
+    if d > 64 then
+      Break;
+
+    onPile := d <= 2;
+    pile := TileOnScreen(dots[tryPile]);
+    bonesDone := False;
+    gotAny := False;
+
+    for pass := 1 to 12 do
+    begin
+      if onPile then
+        pile := TileOnScreen(Minimap.Center);
+
+      if not MainScreen.Bounds.Contains(pile) then
+      begin
+        Logger.Info('Loot: pile ' + ToStr(Round(d / 4)) + ' tiles away is off the screen.');
+        Break;
+      end;
+
+      Mouse.Move(Point(pile.X + Random(-3, 3), pile.Y + Random(-3, 3)));
+      Sleep(LOOT_HOVER_MIN, LOOT_HOVER_MAX);           // a short look before clicking
+      Mouse.Click(EMouseButton.RIGHT);
+
+      if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+      begin
+        Logger.Info('Loot: the right-click menu did not open.');
+        Continue;
+      end;
+
+      Sleep(LOOT_READ_MIN, LOOT_READ_MAX);             // "reading" the menu
+
+      // stackables first, the bones last
+      if not FindLootOption(LOOT_STACKABLES, opt) then
+        if not FindLootOption(LOOT_BONES, opt) then
+        begin
+          opts := '';
+          for o in ChooseOption.GetOptions() do
+            opts += '[' + o.Text + '] ';
+          if gotAny then
+            Logger.Info('Loot: pile done. Left: ' + opts)
+          else
+            Logger.Info('Loot: nothing we want in this pile: ' + opts);
+          ChooseOption.Close();
+          Break;
+        end;
+
+      Logger.Info('Loot: ' + opt.Text);
+      ChooseOption.Select(opt);
+      Result := True;
+      gotAny := True;
+
+      if Pos('ull bon', opt.Text) > 0 then
+      begin
+        Inc(Self.BonesBuried);
+        bonesDone := True;
+      end;
+
+      // the first click walks us onto the pile
+      if not onPile then
+      begin
+        Map.Walker.WaitMoving();
+        onPile := True;
+      end;
+
+      // pause before the next item, now and then a longer one
+      if Random(5) = 0 then
+        Sleep(LOOT_GAP_MAX, LOOT_GAP_MAX + 1200)
+      else
+        Sleep(LOOT_GAP_MIN, LOOT_GAP_MAX);
+
+      if bonesDone then
+        Break;          // bones are the last thing we want
+    end;
+
+    // our kill's pile always has bones: once they are buried we are done
+    if bonesDone then
+      Exit;
+  end;
+end;
+
+procedure TBrutus.Bury();
+var
+  count: Integer;
+  name: String;
+begin
+  while (BoneCount() > 0) and not Chat.LeveledUp() do
+  begin
+    // Brutus respawns: stop burying if a new fight started
+    if BossAlive() then
+      Break;
+
+    count := BoneCount();
+    if Inventory.Items.Count('Bull bones') > 0 then
+      name := 'Bull bones'
+    else
+      name := 'Bones';
+
+    if not Inventory.Items.Interact(name, 'Bury') then
+      Break;
+
+    if SleepUntil(BoneCount() < count, 100, 3000) then
+    begin
+      Inc(Self.BonesBuried);
+      Activity.Restart();
+    end;
+
+    Sleep(500, 900);
+  end;
+
+  Self.BuryAt := Random(1, 3);
+end;
+
+// ---------------------------------------------------------------- main loop
+
+function TBrutus.GetState(): EBrutusState;
+begin
+  if Activity.IsFinished then
+    Exit(EBrutusState.NO_ACTIVITY);
+
+  // Time is up: finish the fight that is going on and loot it, but don't start a new one
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+  begin
+    if BossAlive() then
+    begin
+      Logger.Info('Time is up: finishing the current fight first.');
+      Exit(EBrutusState.FIGHT);
+    end;
+
+    if Self.PendingLoot and Client.IsLoggedIn() then
+      Exit(EBrutusState.LOOT);
+
+    Exit(EBrutusState.MAX_TIME);
+  end;
+
+  if not Client.IsLoggedIn() then
+    Exit(EBrutusState.LOGIN);
+
+  if Chat.LeveledUp() then
+    Exit(EBrutusState.LEVEL_UP);
+
+  // Stop between kills when the food is gone (during a fight CheckHP handles it)
+  if Self.FindFood() = '' then
+    Exit(EBrutusState.OUT_OF_FOOD);
+
+  // ...or the runes / ammo (same way out: teleport, log out)
+  if Self.SuppliesGone() then
+    Exit(EBrutusState.OUT_OF_FOOD);
+
+  // Only the pile from our own kill: take the bones right after he dies
+  if Self.PendingLoot then
+    Exit(EBrutusState.LOOT);
+
+  if BoneCount() >= Self.BuryAt then
+    Exit(EBrutusState.BURY);
+
+  if Self.NeedCenter then
+    Exit(EBrutusState.MIDDLE);
+
+  Result := EBrutusState.FIGHT;
+end;
+
+procedure TBrutus.Run();
+begin
+  Self.Init();
+
+  repeat
+    Self.State := Self.GetState();
+    Logger.Info(ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      EBrutusState.LOGIN: DoLoginSafe();
+      EBrutusState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+
+          // a Hitpoints level raises max HP, so redo the eat limit from the percentage
+          if Stats.GetLevel(ESkill.HITPOINTS) > Self.MaxHP then
+          begin
+            Self.MaxHP := Stats.GetLevel(ESkill.HITPOINTS);
+            Self.EatAt := Ceil(Self.MaxHP * Self.EatPct / 100);
+            Logger.Info('Hitpoints now ' + ToStr(Self.MaxHP) + ': eating at ' + ToStr(Self.EatAt) + ' HP or lower.');
+            Inventory.Open();
+          end;
+        end;
+
+      EBrutusState.LOOT:
+        begin
+          if not Self.LootPile() then
+            Logger.Info('Nothing looted. Moving on.');
+          Self.PendingLoot := False;
+        end;
+
+      EBrutusState.BURY: Self.Bury();
+
+      EBrutusState.MIDDLE:
+        begin
+          Self.MoveToOpenGround();
+          Self.NeedCenter := False;
+        end;
+
+      EBrutusState.FIGHT: Self.Fight();
+
+      EBrutusState.OUT_OF_FOOD, EBrutusState.NO_ACTIVITY, EBrutusState.MAX_TIME: Break;
+    end;
+
+    // Antiban only between fights, never while he is hitting us
+    if Self.State <> EBrutusState.FIGHT then
+      Antiban.DoAntiban();
+  until False;
+
+  // Out of food: get out of the arena and log out
+  // Out of food or out of time: teleport out with the cowbell amulet and log out
+  if (Self.State = EBrutusState.OUT_OF_FOOD) or ((Self.State = EBrutusState.MAX_TIME) and Client.IsLoggedIn()) then
+    Self.Escape();
+
+  if Client.IsLoggedIn() then
+  begin
+    if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+      Logger.Info('NPC attack option set back to hidden.');
+    Inventory.Open();
+  end;
+
+  if Self.NoSupplies <> '' then
+    Logger.Warn('Stopped: ' + Self.NoSupplies + '.')
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+  Logger.Info('Thank you for using ' + Logger.Name);
+end;
+
+// Tells RemoteInput to ignore (or accept again) the user's real mouse and keyboard.
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+  begin
+    if locked then
+      Logger.Warn('RemoteInput is not active, so the client could not be locked.');
+    Exit;
+  end;
+
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// ---------------------------------------------------------------- GUI
+
+var
+  Brutus: TBrutus;
+  BrutusForm: TScriptForm;
+  RuntimeEdit, EatEdit: TLazEdit;
+  LootBox, DebugBox, RingBox: TLazCheckBox;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Brutus.MaxTime := minutes * MINUTE;
+
+  Brutus.EatPct := StrToInt(Trim(EatEdit.Text), 60);
+  if (Brutus.EatPct < 10) or (Brutus.EatPct > 95) then
+    Brutus.EatPct := 60;
+
+  Brutus.CombatStyle := 0;          // left as set in the game (melee, ranged or magic)
+  Brutus.Loot := LootBox.Checked;
+  Brutus.RingBell := RingBox.Checked;
+  DebugMode := DebugBox.Checked;
+  if DebugMode then
+    Logger.Warn('DEBUG MODE: the start-up food and cowbell checks only warn.');
+
+  // fixed settings (no longer in the GUI)
+  Brutus.SlamWait := 2000;        // after a slam sidestep, wait 2 s for another *snorts*
+  Brutus.TankMode := False;       // always dodge the specials
+  Brutus.AntibanSlowdown := 3;    // antiban tasks 3x rarer than WaspLib's default
+
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  imgPath: String;
+  pic: TLazImage;
+begin
+  Self.Setup('Brutus Killer');
+
+  tab := Self.CreateTab('Brutus');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run, in minutes. Type any number.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  EatEdit := TLazEdit.CreateEx(tab, 'Eat at HP (%):', 'Eat when your HP is at or below this percentage. His specials hit for up to ~19, so make sure this works out to 20 HP or more.', 40, 120, 200);
+  EatEdit.Text := '60';
+
+
+  LootBox := TLazCheckBox.CreateEx(tab, 'Loot after each kill', 'Pick up the drops and the bones after each kill. Untick to just keep fighting.', 40, 270);
+  LootBox.Checked := True;
+
+  RingBox := TLazCheckBox.CreateEx(tab, 'Ring the cowbell amulet after each kill',
+    'After each kill (once the drop has landed), ring the cowbell amulet (worn or in the inventory): Brutus respawns about 7.8 s later instead of 21.6 s. Rings once per kill, 3-12 s after it (ringing later can delay him).', 40, 350);
+  RingBox.Checked := True;
+
+  // debugging: start without food / cowbell (fight safety stays on)
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the start-up item checks',
+    'For testing the start-up and walking only. Starts without food or the cowbell amulet (with a warning). Eating and escaping during fights stay on - but with no food it will have to escape early.', 40, 310);
+
+  // your picture: Scripts\images\brutus_killer_gui.png (shown if it exists)
+  imgPath := {$MACRO DIR} + 'images' + PATH_SEP + 'brutus_killer_gui.png';
+  if not FileExists(imgPath) then
+    imgPath := {$MACRO DIR} + 'brutus_killer_gui.png';      // old place: next to the script
+  if FileExists(imgPath) then
+  begin
+    pic := TLazImage.CreateEx(tab);
+    pic.SetBounds(330, 30, 440, 320);
+    pic.Stretch := True;
+    pic.Proportional := True;
+    pic.Picture.LoadFromFile(imgPath);
+  end;
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  BrutusForm.Init();
+
+  SetClientInputLocked(True);
+  try
+    Brutus.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

@@ -1,0 +1,221 @@
+{$I WaspLib/main.simba}
+
+// TEST: walk from the mind golems to the Camdozaal bank chest (your recorded route), open the
+// chest, bank everything in the inventory except food, top the food up to FOOD_AMOUNT, and
+// walk back to the golem spot. Worn gear is never touched (only the inventory is deposited).
+
+var
+  FIGHT_SPOT: TPoint = [12004, 27290];
+  BANK_SPOT: TPoint = [11912, 27238];
+  FOOD_AMOUNT: Integer = 10;     // top the food up to this many
+
+  // Your walk from the golem spot to the bank chest
+  BANK_ROUTE: TPointArray = [
+    [12004, 27290], [11960, 27290], [11956, 27278], [11944, 27262],
+    [11920, 27250], [11912, 27238]
+  ];
+
+  // Anything in this list counts as food and is kept
+  FOODS: TItemArray = [
+    'Shrimps', 'Anchovies', 'Sardine', 'Herring', 'Mackerel', 'Trout', 'Cod', 'Pike', 'Salmon',
+    'Tuna', 'Lobster', 'Bass', 'Swordfish', 'Monkfish', 'Shark', 'Manta ray', 'Anglerfish',
+    'Cooked chicken', 'Cooked meat', 'Bread', 'Cake', '2/3 cake', 'Slice of cake',
+    'Chocolate cake', 'Meat pie', 'Apple pie', 'Redberry pie', 'Pizza', 'Plain pizza',
+    'Stew', 'Potato', 'Baked potato', 'Cabbage', 'Kebab'
+  ];
+
+// Hovers points around `center` in growing rings (about `step` pixels apart, out to `radius`)
+// until the hover text contains one of `texts`; then clicks it and returns the spot.
+function HoverSearch(center: TPoint; texts: TStringArray; radius, step: Integer; out spot: TPoint): Boolean;
+var
+  r, k, n: Integer;
+  pt: TPoint;
+  a: Double;
+begin
+  r := 0;
+  while r <= radius do
+  begin
+    if r = 0 then
+      n := 1
+    else
+      n := Max(6, Round(2 * PI * r / step));
+
+    for k := 0 to n - 1 do
+    begin
+      a := 2 * PI * k / n;
+      pt := Point(center.X + Round(r * Cos(a)) + Random(-2, 2), center.Y + Round(r * Sin(a)) + Random(-2, 2));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(texts, True, 0.85, 60) then
+      begin
+        Target.MouseClick(EMouseButton.LEFT);
+        spot := pt;
+        Exit(True);
+      end;
+    end;
+
+    r += step;
+  end;
+end;
+
+// Walks your recorded route to the bank chest (toBank) or back to the golem spot, one point
+// at a time with minimap clicks, each point shifted up to a tile. True when we arrive.
+function WalkRoute(toBank: Boolean): Boolean;
+var
+  path: TPointArray;
+  me, wp, mm: TPoint;
+  i, start: Integer;
+  d, bestD, vx, vy, len, reach: Double;
+  pointEnd: UInt64;
+begin
+  if toBank then
+    path := BANK_ROUTE
+  else
+  begin
+    for i := High(BANK_ROUTE) downto 0 do
+      path += BANK_ROUTE[i];
+  end;
+
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+  begin
+    Logger.Warn('Walk: position unknown.');
+    Exit;
+  end;
+
+  start := 0;
+  bestD := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < bestD then
+    begin
+      bestD := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if (start < High(path)) and (me.DistanceTo(path[start + 1]) < path[start].DistanceTo(path[start + 1])) then
+    Inc(start);
+
+  if toBank then
+    Logger.Info('Walk: to the bank chest.')
+  else
+    Logger.Info('Walk: back to the golem spot.');
+
+  for i := start to High(path) do
+  begin
+    wp := path[i];
+    if i < High(path) then
+    begin
+      wp := Point(wp.X + Random(-4, 4), wp.Y + Random(-4, 4));
+      reach := 3;
+    end
+    else
+      reach := 1;
+
+    pointEnd := GetTimeRunning() + 20000;
+    repeat
+      me := Map.Position();
+      d := me.DistanceTo(wp) / RSTranslator.TILE_SIZE;
+      if d <= reach then
+        Break;
+
+      if GetTimeRunning() > pointEnd then
+      begin
+        Logger.Warn('Walk: could not reach point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+        Exit(False);
+      end;
+
+      mm := TWalker.Point2MM(me, wp, Minimap.CompassRadians);
+      vx := mm.X - Minimap.Center.X;
+      vy := mm.Y - Minimap.Center.Y;
+      len := Sqrt(vx * vx + vy * vy);
+      if len > 52 then
+      begin
+        vx := vx / len * 52;
+        vy := vy / len * 52;
+      end;
+
+      Mouse.Click(Point(Minimap.Center.X + Round(vx) + Random(-1, 1), Minimap.Center.Y + Round(vy) + Random(-1, 1)), EMouseButton.LEFT);
+      Sleep(500, 800);
+      SleepUntil((Map.Position().DistanceTo(wp) <= reach * RSTranslator.TILE_SIZE) or not Minimap.IsPlayerMoving(), 150, 6000);
+    until False;
+  end;
+
+  Result := True;
+end;
+
+var
+  spot: TPoint;
+  food: String;
+  f: TItem;
+  have: Integer;
+begin
+  Logger.Setup('Bank Test');
+
+  if not Client.IsLoggedIn() then
+    Login.DoLogin();
+  StartListeners(300);
+
+  Map.Setup([Chunk(Box(44, 92, 48, 88), 0)]);
+  Logger.Info('We are at [' + ToStr(Map.Position().X) + ', ' + ToStr(Map.Position().Y) + '].');
+
+  // 1. walk to the chest
+  if not WalkRoute(True) then
+    Logger.Warn('Did not reach the bank spot, trying to open the chest from here.');
+
+  // 2. open it
+  Logger.Info('Looking for the bank chest.');
+  if not HoverSearch(MainScreen.Bounds.Center, ['Bank chest', 'ank chest', 'Use Bank', 'Bank Bank', 'Bank Chest'], 220, 22, spot) then
+  begin
+    Logger.Error('Could not find the bank chest on the screen. Hover it yourself and post what the top-left text says in a GitHub issue.');
+    Exit;
+  end;
+
+  Map.Walker.WaitMoving();
+  if not SleepUntil(Bank.IsOpen(), 100, 8000) then
+  begin
+    Logger.Error('Clicked the chest, but the bank did not open.');
+    Exit;
+  end;
+  Logger.Info('Bank open (chest found at ' + ToStr(spot.X) + ', ' + ToStr(spot.Y) + ').');
+
+  // 3. bank everything except food
+  if Bank.DepositDifferent(FOODS) then
+    SleepUntil(not Inventory.Items.ContainsDifferent(FOODS), 100, 3000);
+  Logger.Info('Deposited. ' + ToStr(Inventory.Slots.Count()) + ' slot(s) still used (food).');
+
+  // 4. top the food back up (the food you carry; if you have none left, nothing to match)
+  food := '';
+  for f in FOODS do
+    if Inventory.Items.Count(f) > 0 then
+    begin
+      food := f;
+      Break;
+    end;
+
+  if food = '' then
+    Logger.Warn('No food in the inventory, so I don''t know which food to take. Skipping the top-up.')
+  else
+  begin
+    have := Inventory.Items.Count(food);
+    if have < FOOD_AMOUNT then
+    begin
+      Logger.Info('Food: have ' + ToStr(have) + ' ' + food + ', taking out ' + ToStr(FOOD_AMOUNT - have) + '.');
+      Bank.Withdraw(new TBankItem(food, FOOD_AMOUNT - have));
+      if SleepUntil(Inventory.Items.Count(food) > have, 100, 3000) then
+        Logger.Info('Food: now ' + ToStr(Inventory.Items.Count(food)) + ' ' + food + '.')
+      else
+        Logger.Warn('Food: could not take out more ' + food + ' (none left in the bank?).');
+    end
+    else
+      Logger.Info('Food: already have ' + ToStr(have) + ' ' + food + ', no top-up needed.');
+  end;
+
+  Bank.Close();
+
+  // 5. back to the golems
+  if WalkRoute(False) then
+    Logger.Info('Back at the golem spot. Test done.')
+  else
+    Logger.Warn('Did not make it back to the golem spot.');
+end.

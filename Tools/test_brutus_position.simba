@@ -1,0 +1,58 @@
+{$I WaspLib/main.simba}
+
+// TEST: can WaspLib place you inside the Brutus arena? Only READS the screen, never clicks.
+// Start it standing inside the arena and walk around a bit for ~30 s. Every second it logs
+// where WaspLib thinks you are and how good the match is (Similarity, 0..1).
+//   - steady coordinates that change by one tile per step, Similarity around 0.6 or more
+//     -> WaspLib can place you: the bot can use known spots in the arena
+//   - jumping coordinates or a low Similarity -> the arena isn't on WaspLib's map
+// It also logs the pen gate ("Release") and how many fence pieces WaspLib knows near you.
+// If something looks wrong, post the log in a GitHub issue.
+
+var
+  me: TPoint;
+  gates, fences: TMapObjectDataArray;
+  data: TMapObjectData;
+  p: TPoint;
+  i, nearFence: Integer;
+begin
+  Logger.Setup('Brutus Position Test');
+  if not Client.IsLoggedIn() then
+    Login.DoLogin();
+
+  Logger.Info('Map: loading Lumbridge and the cow fields (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(49, 52, 52, 49), 0)]);
+
+  for i := 1 to 30 do
+  begin
+    me := Map.Position();
+    Logger.Info('Position: map [' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']  game (' +
+                ToStr(me.X div 4) + ', ' + ToStr((50430 - me.Y) div 4) + ')  Similarity ' +
+                FormatFloat('0.00', Map.Similarity));
+    Sleep(1000);
+  end;
+
+  try
+    gates := MapObjects.GetByAction('Release');
+  except
+    gates := [];
+  end;
+  for data in gates do
+    for p in data.Coordinates do
+      Logger.Info('Gate with Release: "' + data.Name + '" at game (' + ToStr(p.X div 4) + ', ' +
+                  ToStr((50430 - p.Y) div 4) + '), ' + ToStr(Round(p.DistanceTo(me) / 4)) + ' tiles from you.');
+  if gates = [] then
+    Logger.Info('Gate with Release: none on this map.');
+
+  try
+    fences := MapObjects.GetByName('Fence');
+  except
+    fences := [];
+  end;
+  for data in fences do
+    for p in data.Coordinates do
+      if p.DistanceTo(me) <= 25 * 4 then
+        Inc(nearFence);
+  Logger.Info('Fence pieces within 25 tiles: ' + ToStr(nearFence) + '.');
+  Logger.Info('TEST DONE - please post this log in a GitHub issue.');
+end.

@@ -1,0 +1,321 @@
+{$I WaspLib/main.simba}
+
+// TEST: Lumbridge Castle bank (the same code the AIO miner uses).
+// Start on the ground floor anywhere near Lumbridge Castle. It:
+//   1. walks to the staircase, "Top-floor", walks north to the bank, opens it
+//   2. waits a second, closes it, walks back south, "Bottom-floor staircase"
+//   3. walks to the front of the castle (courtyard)
+//   4. goes back up and opens the bank again
+// Everything is logged; if something fails, post the log in a GitHub issue.
+
+var
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // game (3206, 3209), from your coordinate finder
+  CASTLE_FRONT: TPoint = [12888, 37558];       // game (3222, 3218), the courtyard in front of the castle
+  // top floor (your coordinate finder): where the stairs put you, and the bank booths
+  TOP_STAIRS: TPoint = [64032, 37590];
+  TOP_BANK: TPoint = [64036, 37550];
+
+  WalkDeadline, WalkLogAt: UInt64;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+  end;
+end;
+
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+begin
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+function HoverFind(center: TPoint; texts: TStringArray; radius, step: Integer): Boolean;
+var
+  r, k, n: Integer;
+  pt: TPoint;
+  a: Double;
+begin
+  r := 0;
+  while r <= radius do
+  begin
+    if r = 0 then
+      n := 1
+    else
+      n := Max(6, Round(2 * PI * r / step));
+    for k := 0 to n - 1 do
+    begin
+      a := 2 * PI * k / n;
+      pt := Point(center.X + Round(r * Cos(a)) + Random(-2, 2), center.Y + Round(r * Sin(a)) + Random(-2, 2));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(texts, True, 0.85, 60) then
+        Exit(True);
+    end;
+    r += step;
+  end;
+end;
+
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if (bj = -1) or (best > maxTiles * RSTranslator.TILE_SIZE) then
+    Exit(False);
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Logger.Info('WaspLib object: "' + single.Name + '" at [' + ToStr(single.Coordinates[0].X) + ', ' +
+              ToStr(single.Coordinates[0].Y) + '].');
+  Result := True;
+end;
+
+// Use the staircase WaspLib knows next to `spot` with one of `options` ("Top-floor" /
+// "Bottom-floor"). No searching the screen.
+function UseStaircase(spot: TPoint; options: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, t: String;
+  hovered, found, goingDown: Boolean;
+begin
+  goingDown := Pos('ottom', options[0]) > 0;
+  if not NearestObject(['Staircase'], spot, 6, stairs) then
+  begin
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+    Exit;
+  end;
+
+  // put the mouse on WaspLib's staircase, then right-click and choose the option ourselves
+  try
+    hovered := stairs.WalkHover([]);
+  except
+    Logger.Warn('Stairs: ' + GetExceptionMessage());
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  // The menu reader garbles letters ("Too-floor", "Climb-uo"), so don't match the exact
+  // words: "Top-floor" = any line with "floor" that isn't "Bottom"; "Bottom-floor" = a line
+  // with "ottom"/"Bott".
+  found := False;
+  for opt in ChooseOption.GetOptions() do
+  begin
+    menu += '[' + opt.Text + '] ';
+    if found then
+      Continue;
+    t := Lowercase(opt.Text);
+    if Pos('floor', t) = 0 then
+      Continue;
+    if goingDown = ((Pos('ottom', t) > 0) or (Pos('bott', t) > 0)) then
+    begin
+      pick := opt;
+      found := True;
+    end;
+  end;
+
+  if found then
+  begin
+    ChooseOption.Select(pick);    // (selecting a TOption returns nothing)
+    Result := True;
+  end;
+  if not Result then
+  begin
+    Logger.Warn('Stairs: no ' + options[0] + ' option. The menu says: ' + menu);
+    if ChooseOption.IsOpen() then
+      ChooseOption.Close();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicked ' + options[0] + '.');
+  Sleep(2500, 3500);
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+function OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+begin
+  if Bank.IsOpen() then
+    Exit(True);
+
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 120000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['Top-floor', 'op-floor', 'Top floor']) then
+      Exit;
+    if not SleepUntil(CurrentFloor() = 2, 300, 5000) then
+      Logger.Warn('Bank: not on the top floor after climbing? We are at ' + Here() + '.');
+  end
+  else
+    Logger.Info('Bank: already on the top floor.');
+
+  Logger.Info('Bank: opening the bank booth WaspLib knows on the top floor.');
+  if NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+  begin
+    try
+      if Bank.Open(booth, True) then
+        Exit(True);
+    except
+      Logger.Warn('Bank: ' + GetExceptionMessage());
+    end;
+  end
+  else
+    Logger.Warn('Bank: WaspLib knows no bank booth up here, falling back to its hover text.');
+
+  if not SafeWebWalk(TOP_BANK, 30000, 2) then
+    StepDirection(0, -1, 10);
+
+  Logger.Info('Bank: looking for a bank booth.');
+  if not HoverFind(MainScreen.Bounds.Center, ['Bank Bank booth', 'Bank booth', 'Bank Banker', 'ank booth'], 300, 16) then
+  begin
+    Logger.Warn('Bank: no bank booth found on the top floor.');
+    Exit;
+  end;
+  Mouse.Click(EMouseButton.LEFT);
+  Result := SleepUntil(Bank.IsOpen(), 100, 8000);
+end;
+
+function GoDown(): Boolean;
+begin
+  if CurrentFloor() = 0 then
+    Exit(True);
+  Logger.Info('Travel: walking to the top-floor stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  Logger.Info('Travel: "Bottom-floor staircase".');
+  Result := UseStaircase(TOP_STAIRS, ['Bottom-floor', 'ottom-floor', 'Bottom floor']);
+  if Result and SleepUntil(CurrentFloor() = 0, 300, 5000) then
+    Logger.Info('Travel: back on the ground floor at ' + Here() + '.')
+  else
+    Result := False;
+end;
+
+procedure Step(ok: Boolean; name: String);
+begin
+  if ok then
+    Logger.Info('>>> ' + name + ': OK')
+  else
+  begin
+    Logger.Error('>>> ' + name + ': FAILED. Please post this log in a GitHub issue.');
+    TerminateScript();
+  end;
+end;
+
+begin
+  Logger.Setup('Lumbridge Bank Test');
+  if not Client.IsLoggedIn() then
+    Login.DoLogin();
+  StartListeners(300);
+
+  // Lumbridge ground floor + the castle's top floor (floor 2), so it knows where it is on both
+  Map.Setup([Chunk(Box(49, 51, 51, 49), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  Logger.Info('Start: we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + '.');
+
+  Step(OpenLumbridgeBank(), '1. Open the bank');
+  Sleep(1000, 1300);
+  Bank.Close();
+
+  Step(GoDown(), '2. Down the stairs');
+
+  Logger.Info('Travel: to the front of the castle.');
+  Step(SafeWebWalk(CASTLE_FRONT, 60000, 3), '3. Walk to the front of the castle');
+  Sleep(800, 1500);
+
+  Step(OpenLumbridgeBank(), '4. Back up to the bank');
+  Logger.Info('TEST DONE: everything worked.');
+end.

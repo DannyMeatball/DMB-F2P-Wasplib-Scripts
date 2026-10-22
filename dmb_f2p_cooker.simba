@@ -1,0 +1,1643 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =====================================================================================
+//  DMB's F2P Cooker                                          Simba 2.0 + WaspLib
+// =====================================================================================
+// FILES (all in Scripts\)
+//   dmb_f2p_cooker.simba      this script
+//   Logs go to Data\Logs\DMB's F2P Cooker\
+//
+// HOW TO USE
+//   Put your raw food in the bank. Start it logged in (or at the login screen). It reads your
+//   Cooking level, then opens the settings window. Pick where to cook ("Nearest" = the closest
+//   to where you stand when you press Start) and the food from the list, press Start. Then,
+//   round and round:
+//     bank -> search the bank for the food by name -> take it all out ->
+//     walk to the range / fire -> click it -> click the food in the cook menu (the quantity
+//     stays on All) -> wait while it cooks -> bank the cooked (and burnt) food.
+//   While it runs, RuneLite ignores your own mouse and keyboard.
+//
+// WHERE                         BANK                    COOKS ON
+//   Lumbridge Castle kitchen    Lumbridge (top floor)   the kitchen range (ground floor)
+//   Barbarian Village           Edgeville               the fire by the fishing spots (added by hand)
+//   Al Kharid                   Al Kharid               the range north of the bank (through the
+//                                                       toll gate, or the long way round)
+//   Draynor Village             Draynor                 the fire WaspLib knows near the bank (untested)
+//
+// FOOD (F2P)                    COOKING
+//   Shrimps, anchovies, sardine, chicken, beef, rat meat, bear meat, bread dough    1
+//   Herring 5, redberry pie 10, trout 15, pike 20, meat pie 20, salmon 25, stew 25, tuna 30,
+//   apple pie 30, lobster 40, cake 40, swordfish 45
+//   Bread, pies and cake need a range (not the Barbarian Village / Draynor fires).
+//   Food you lack the level for is LOCKED in the settings. When the bank runs out it stops.
+//
+// ITEMS: whatever you carry at Start (except food) is yours: never banked.
+//
+// DEBUG (tick "Debug: turn off the level and item checks") - for testing the walking:
+//   LOCKED food starts anyway; no raw food only gives a warning: it still walks to the range /
+//   fire and back to the bank, round and round.
+//
+// SAFETY: never into the Wilderness; every walk has a time limit and an 8 s stuck check;
+//   banks, ranges and stairs are WaspLib's own objects (the Barbarian Village fire is a known
+//   tile, checked by its hover text) - no searching the screen.
+// =====================================================================================
+
+type
+  TCookPlace = record
+    Name, BankName: String;
+    Bank, Cook: TPoint;             // game tiles: the bank, the range / fire
+    CookNames: TStringArray;        // the range / fire's name in WaspLib's data
+    HandFire, HandStand: TPoint;    // game tiles: a fire WaspLib's data is missing + where to stand
+    Lumbridge, AlKharid: Boolean;
+  end;
+
+  ECookState = enum(LOGIN, LEVEL_UP, OPEN_BANK, BANK, COOK, NO_ACTIVITY, MAX_TIME, STOP);
+
+const
+  ANTIBAN_SLOWDOWN = 3;
+  TOLL_COINS = 10;
+
+var
+  PLACES: array of TCookPlace;
+
+  // the F2P food: its name in the bank, the Cooking level, what the cook menu's hint says
+  // (part of it, lower case), and whether it needs a range (no fires)
+  RAW_NAMES: TStringArray = ['Raw shrimps', 'Raw anchovies', 'Raw sardine', 'Raw chicken', 'Raw beef',
+                             'Raw rat meat', 'Raw bear meat', 'Bread dough', 'Raw herring',
+                             'Uncooked redberry pie', 'Raw trout', 'Raw pike', 'Uncooked meat pie',
+                             'Raw salmon', 'Uncooked stew', 'Raw tuna', 'Uncooked apple pie',
+                             'Raw lobster', 'Uncooked cake', 'Raw swordfish'];
+  RAW_LEVELS: TIntegerArray = [1, 1, 1, 1, 1, 1, 1, 1, 5, 10, 15, 20, 20, 25, 25, 30, 30, 40, 40, 45];
+  COOKED_HINTS: TStringArray = ['shrimps', 'anchovies', 'sardine', 'chicken', 'meat', 'meat', 'meat',
+                                'bread', 'herring', 'redberry pie', 'trout', 'pike', 'meat pie',
+                                'salmon', 'stew', 'tuna', 'apple pie', 'lobster', 'cake', 'swordfish'];
+  RANGE_ONLY: array of Boolean = [False, False, False, False, False, False, False, True, False,
+                                  True, False, False, True, False, False, False, True, False, True, False];
+
+  COOK_RANGE: TStringArray = ['Range', 'Cooking range', 'Cook''s range'];
+  COOK_FIRE: TStringArray = ['Fire'];
+
+  // Lumbridge Castle (tested in the miner and fisher): ground-floor staircase, top floor
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // game (3206, 3209)
+  TOP_STAIRS: TPoint = [64032, 37590];
+  TOP_BANK: TPoint = [64036, 37550];
+
+  // walker watchdog
+  WalkDeadline, WalkLogAt, WalkStallSince: UInt64;
+  WalkStallSpot: TPoint;
+  WildernessHit: Boolean;
+
+procedure AddPlace(name, bankName: String; bx, by, kx, ky: Integer; cookNames: TStringArray; lumbridge, alKharid: Boolean);
+var
+  p: TCookPlace;
+begin
+  p.Name := name;
+  p.BankName := bankName;
+  p.Bank := Point(bx, by);
+  p.Cook := Point(kx, ky);
+  p.CookNames := cookNames;
+  p.Lumbridge := lumbridge;
+  p.AlKharid := alKharid;
+  PLACES += p;
+end;
+
+// Range / fire tiles are the ones the fisher uses (Barbarian Village's fire is from your
+// coordinate finder: one tile south of (3106, 3433)).
+procedure SetupPlaces();
+begin
+  AddPlace('Lumbridge Castle kitchen', 'Lumbridge Castle (top floor)', 3206, 3209, 3211, 3215, COOK_RANGE, True, False);
+  AddPlace('Barbarian Village',        'Edgeville',                     3094, 3492, 3106, 3432, [],         False, False);
+  PLACES[High(PLACES)].HandFire := Point(3106, 3432);
+  PLACES[High(PLACES)].HandStand := Point(3106, 3433);
+  AddPlace('Al Kharid',                'Al Kharid',                     3270, 3167, 3273, 3180, COOK_RANGE, False, True);
+  AddPlace('Draynor Village',          'Draynor',                       3092, 3243, 3092, 3243, COOK_FIRE,  False, False);
+end;
+
+// ---------------------------------------------------------------- helpers (from the miner/fisher)
+
+// Game tile -> WaspLib map pixels (the same numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// North of the Wilderness ditch (game y 3523 and up)? Map pixels.
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+// East of the Lumbridge / Al Kharid fence?
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // never into the Wilderness (a destination hundreds of tiles away is a bad point from
+  // WaspLib's walker, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  // stuck against something: not moved a tile in 8 s -> stop
+  if WalkDeadline > 0 then
+  begin
+    if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+    begin
+      WalkStallSpot := position;
+      WalkStallSince := GetTimeRunning();
+    end
+    else if GetTimeRunning() - WalkStallSince > 8000 then
+    begin
+      Logger.Warn('Walk: not moved for 8 s at [' + ToStr(position.X) + ', ' + ToStr(position.Y) +
+                  '] (stuck on something), stopping this walk.');
+      walker^.Walking := False;
+      WalkDeadline := 0;
+    end;
+  end;
+end;
+
+// Start the watchdog's time limit + stall check for a walk WaspLib does itself (bank, furnace).
+procedure GuardWalk(ms: Integer);
+begin
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+end;
+
+// WaspLib's walker with a time limit. True when we end within `reachTiles` of `dest`.
+function WebWalkRaw(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  if InWilderness(dest) then
+  begin
+    Logger.Error('Walk: refusing to walk into the Wilderness.');
+    WildernessHit := True;
+    Exit(False);
+  end;
+
+  GuardWalk(ms);
+  try
+    // fill in a point every 10 tiles: the minimap only reaches ~15 tiles
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// Minimap click `tiles` tiles away in a world direction (dx east, dy north = -1...).
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Logger.Warn('WaspLib objects: looking up "' + name + '" failed: ' + GetExceptionMessage());
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if bj = -1 then
+  begin
+    Logger.Warn('WaspLib objects: no "' + names[0] + '" in the loaded map at all.');
+    Exit(False);
+  end;
+  if best > maxTiles * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('WaspLib objects: nearest "' + single.Name + '" is ' + ToStr(Round(best / RSTranslator.TILE_SIZE)) +
+                ' tiles away (want ' + ToStr(maxTiles) + ').');
+    Exit(False);
+  end;
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Result := True;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+// Use the staircase WaspLib knows next to `spot`. `wanted` are bits of the menu line to pick,
+// best first (the menu reader garbles letters, so short bits: 'op-floor', 'limb-up'...). The
+// first menu line containing the earliest bit wins. The log says which line it clicked.
+function UseStaircase(spot: TPoint; wanted: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, w: String;
+  hovered, found: Boolean;
+begin
+  if NearestObject(['Staircase'], spot, 6, stairs) then
+    try
+      hovered := stairs.Hover([]);
+      if not hovered then
+        hovered := stairs.WalkHover([]);
+    except
+      Logger.Warn('Stairs: ' + GetExceptionMessage());
+    end
+  else
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  found := False;
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+
+  if not found then
+  begin
+    Logger.Warn('Stairs: none of ' + ToStr(wanted) + ' in the menu. It says: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Sleep(2500, 3500);
+  Result := True;
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+procedure SlowAntiban();
+var
+  i: Integer;
+begin
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+end;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// Coins in the inventory: the size of the stack (Count would only count the slots).
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= TOLL_COINS then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// An inventory item selected ("Use Burnt fish -> ...")? Then every click on the bank or the
+// range turns into "use the item on it" and fails. Click the item again to unselect it.
+procedure UnselectItem();
+var
+  sel: Integer;
+begin
+  try
+    sel := Inventory.GetSelected();
+  except
+    Exit;
+  end;
+  if sel < 0 then
+    Exit;
+  Logger.Info('An item in the inventory was selected (slot ' + ToStr(sel + 1) + ') - unselecting it.');
+  Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+  SleepUntil(Inventory.GetSelected() < 0, 100, 1500);
+  Mouse.Move(Point(MainScreen.Bounds.Center.X + Random(-80, 80), MainScreen.Bounds.Center.Y + Random(-60, 60)));
+end;
+
+// ---------------------------------------------------------------- Lumbridge Castle bank
+
+// ---------------------------------------------------------------- Al Kharid toll gate (from the smelter)
+// Any walk that crosses the Lumbridge / Al Kharid fence goes through the toll gate first, by
+// trying it: "Open" (free with Prince Ali Rescue), the guard / "Pay-toll" with 10+ coins,
+// turning the camera if the gate can't be seen. Not let through: the long way round the fence.
+
+var
+  TOLL_GATE: TPoint = [13068, 37522];
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+  // the long way round the fence (no coins, no Prince Ali Rescue), game tiles
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+// Coins in the inventory (the stack size).
+function GateCoins(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= 10 then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free).
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through: we can't get through here (the caller walks the long way round).
+function CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not WebWalkRaw(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := GateCoins();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= 10 then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if GateMenu(gate, ['oll', 'Pay'], menu) then
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+    begin
+      Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+  // 4) no way through here
+  if coins < 10 then
+    Logger.Warn('Gate: not let through and fewer than 10 coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence (when the toll gate doesn't let us through).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not WebWalkRaw(path[0], 240000, 4) then
+      Exit;
+  end;
+
+  Logger.Info('Long way: walking round the fence.');
+  for i := start to High(path) do
+    if not WebWalkRaw(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+      Exit;
+    end;
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+end;
+
+// WaspLib's walker with our time limit, through the toll gate first when the walk crosses the
+// Lumbridge / Al Kharid fence. True when we end within `reachTiles` of `dest`.
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  me: TPoint;
+  into: Boolean;
+begin
+  me := Map.Position();
+  if (me.X <> 0) and (me.X < RSTranslator.MapWidth) and (dest.X < RSTranslator.MapWidth) and
+     (InAlKharid(me) <> InAlKharid(dest)) and not InWilderness(dest) then
+  begin
+    into := InAlKharid(dest);
+    if not CrossTollGate() then
+    begin
+      Logger.Info('Walk: the toll gate is no good - taking the long way round the fence.');
+      if not WalkLongWay(into) then
+      begin
+        Logger.Warn('Walk: could not get past the Al Kharid fence (toll gate or the long way).');
+        Exit(False);
+      end;
+    end;
+  end;
+  CloseStrayInterface(True);
+  Result := WebWalkRaw(dest, ms, reachTiles);
+  // a window popped up during the walk (misclick): close it and walk again, once
+  if (not Result) and CloseStrayInterface(True) then
+  begin
+    Logger.Info('Walk: a window was in the way - closed it, walking again.');
+    Result := WebWalkRaw(dest, ms, reachTiles);
+  end;
+end;
+
+
+function OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+begin
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 180000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['op-floor', 'top floor', 'floor', 'limb-up', 'limb-u']) then
+      Exit;
+    SleepUntil(CurrentFloor() in [1, 2], 300, 6000);
+    if CurrentFloor() = 1 then
+    begin
+      Logger.Info('Bank: on the middle floor - climbing up once more.');
+      UseStaircase(Point(LUMBRIDGE_STAIRS.X + RSTranslator.MapWidth, LUMBRIDGE_STAIRS.Y), ['limb-up', 'limb-u', 'op-floor']);
+      SleepUntil(CurrentFloor() = 2, 300, 6000);
+    end;
+    if CurrentFloor() <> 2 then
+    begin
+      Logger.Warn('Bank: not on the top floor after climbing (we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + ').');
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: opening the top-floor bank booth.');
+  if not NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+    Exit;
+  // just off the stairs WaspLib can give up straight away: settle first
+  Map.Walker.WaitMoving();
+  UnselectItem();
+  Sleep(600, 1000);
+  GuardWalk(45000);
+  try
+    Result := Bank.Open(booth, True);
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  if Result or Bank.IsOpen() then
+    Exit(True);
+
+  // didn't open: walk over to the booths ourselves, then try again
+  Logger.Info('Bank: did not open from the stairs - walking to the booths and trying again.');
+  SafeWebWalk(TOP_BANK, 30000, 2);
+  Map.Walker.WaitMoving();
+  Sleep(400, 800);
+  GuardWalk(30000);
+  try
+    Result := Bank.Open(booth, True);
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Result or Bank.IsOpen();
+end;
+
+function LeaveTopFloor(): Boolean;
+begin
+  Logger.Info('Travel: down the Lumbridge Castle stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  if UseStaircase(TOP_STAIRS, ['ottom-floor', 'ottom', 'floor', 'limb-down', 'limb-d']) then
+    SleepUntil(CurrentFloor() in [0, 1], 300, 6000);
+  if CurrentFloor() = 1 then
+  begin
+    Logger.Info('Travel: on the middle floor - climbing down once more.');
+    UseStaircase(Point(TOP_STAIRS.X - RSTranslator.MapWidth, TOP_STAIRS.Y), ['limb-down', 'limb-d', 'ottom']);
+    SleepUntil(CurrentFloor() = 0, 300, 6000);
+  end;
+  Result := CurrentFloor() = 0;
+end;
+
+
+// ---------------------------------------------------------------- bank search (from the smither)
+
+// The bank is showing search results: take the first slot whose hover text names `item`,
+// right-click it and pick Withdraw-All (or Withdraw-1 for the hammer).
+function WithdrawFromResults(item, option: String): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to 7 do
+  begin
+    Mouse.Move(Bank.Slots.Box(i));
+    Sleep(150, 300);
+    if Pos(item, MainScreen.UpText) = 0 then
+      Continue;
+    Mouse.Click(EMouseButton.RIGHT);
+    if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+      Continue;
+    Sleep(150, 350);
+    if ChooseOption.Select([option, Lowercase(option)]) then
+      Exit(True);
+    CancelMenu();
+  end;
+end;
+
+// Search the bank for `item` and withdraw it from the results. True when the inventory grew.
+function SearchAndWithdraw(item, option: String): Boolean;
+var
+  before: Integer;
+begin
+  before := Inventory.Slots.Count();
+  if not Bank.Search(item) then
+    Logger.Warn('Bank: search for ' + item + ' did not work.');
+  if not WithdrawFromResults(item, option) then
+    Logger.Warn('Bank: no ' + item + ' in the search results.');
+  Result := SleepUntil(Inventory.Slots.Count() > before, 100, 3000);
+  Bank.ClearSearch();
+end;
+
+// Where a tile (map pixels) is on the game screen, from where we stand.
+function TileOnScreen(tile: TPoint; out pt: TPoint): Boolean;
+var
+  mm: TPoint;
+begin
+  mm := TWalker.Point2MM(Map.Position(), tile, Minimap.CompassRadians);
+  pt := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  Result := MainScreen.Bounds.Contains(pt);
+end;
+
+
+// ---------------------------------------------------------------- the cooker
+
+type
+  TCooker = record
+    MaxTime: UInt64;
+    Place: TCookPlace;
+    Nearest: Boolean;               // the settings said "Nearest"
+    Food: Integer;                  // index into RAW_NAMES (what we're cooking now)
+    IgnoreChecks: Boolean;          // debug
+    CookLevel: Integer;
+    BankObj: TObject;
+    HasBankObj: Boolean;
+    DebugTrip: Boolean;             // debug: no food, walk to the range / fire and back anyway
+    Cooked, Trips, Failures, CookFails: Integer;
+    StartItems: TItemArray;         // what you started with: never banked
+    StopReason: String;
+    State: ECookState;
+  end;
+
+function TCooker.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Self.Place.Name,
+    RAW_NAMES[Self.Food],
+    ToStr(Self.Cooked),
+    FormatNumber(Self.Cooked / Logger.TimeRunning.Elapsed * HOUR),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+function TCooker.FoodName(): String;
+begin
+  Result := RAW_NAMES[Self.Food];
+end;
+
+function TCooker.RawCount(): Integer;
+begin
+  Result := Inventory.Items.Count(Self.FoodName());
+end;
+
+function TCooker.HandFire(): Boolean;
+begin
+  Result := (Self.Place.HandFire.X <> 0) or (Self.Place.HandFire.Y <> 0);
+end;
+
+function TCooker.CookTile(): TPoint;
+begin
+  Result := Tile(Self.Place.Cook.X, Self.Place.Cook.Y);
+end;
+
+// Food (raw, cooked or burnt) isn't "yours": it gets banked.
+function IsFood(item: String): Boolean;
+var
+  k: Integer;
+  l: String;
+begin
+  l := Lowercase(item);
+  if (Pos('raw ', l) = 1) or (Pos('uncooked', l) = 1) or (Pos('dough', l) > 0) or (Pos('burnt', l) > 0) then
+    Exit(True);
+  for k := 0 to High(COOKED_HINTS) do
+    if Pos(COOKED_HINTS[k], l) > 0 then
+      Exit(True);
+end;
+
+// Everything in the inventory at the start (except food) is yours to keep: never banked.
+procedure TCooker.RememberStartItems();
+var
+  item, k: TItem;
+  skip: Boolean;
+begin
+  Self.StartItems := [];
+  for item in Inventory.Items.RecognizeAll() do
+  begin
+    if (item = '') or IsFood(item) then
+      Continue;
+    skip := False;
+    for k in Self.StartItems do
+      if SameText(item, k) then
+        skip := True;
+    if not skip then
+      Self.StartItems += item;
+  end;
+  if Self.StartItems <> [] then
+    Logger.Info('Keeping what you started with (never banked): ' + ToStr(Self.StartItems) + '.');
+end;
+
+// A place that only has a fire (no range)?
+function FireOnly(p: TCookPlace): Boolean;
+begin
+  Result := (p.HandFire.X <> 0) or (p.HandFire.Y <> 0) or
+            ((Length(p.CookNames) > 0) and (p.CookNames[0] = 'Fire'));
+end;
+
+// The place whose bank is closest to where we stand (straight line, ground floor); for food
+// that needs a range, only places with a range. A place on the other side of the Al Kharid toll
+// gate counts 60 tiles further; upstairs in Lumbridge Castle = Lumbridge.
+function NearestPlace(rangeOnly: Boolean): Integer;
+var
+  me: TPoint;
+  i: Integer;
+  best, d: Double;
+begin
+  Result := 0;
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit;
+  if me.X >= RSTranslator.MapWidth then
+  begin
+    for i := 0 to High(PLACES) do
+      if PLACES[i].Lumbridge then
+        Exit(i);
+  end;
+  best := 1000000000;
+  for i := 0 to High(PLACES) do
+  begin
+    if rangeOnly and FireOnly(PLACES[i]) then
+      Continue;
+    d := Min(me.DistanceTo(Tile(PLACES[i].Bank.X, PLACES[i].Bank.Y)),
+             me.DistanceTo(Tile(PLACES[i].Cook.X, PLACES[i].Cook.Y)));
+    if PLACES[i].AlKharid <> InAlKharid(me) then
+      d += 60 * RSTranslator.TILE_SIZE;   // the other side of the toll gate: only if it's much closer
+    if d < best then
+    begin
+      best := d;
+      Result := i;
+    end;
+  end;
+end;
+
+procedure TCooker.Init();
+begin
+  Logger.Setup('DMB''s F2P Cooker');
+  ProgressReport.Setup(
+    'DMB''s F2P Cooker',
+    ['Script runtime:', 'Place:', 'Food:', 'Cooked:', 'Cooked/H:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+  StartListeners(300);
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  Self.CookLevel := Stats.GetLevel(ESkill.COOKING, False);
+  Inventory.Open();
+  Logger.Info('Cooking level: ' + ToStr(Self.CookLevel) + '.');
+  Self.RememberStartItems();
+
+  if (Self.CookLevel > 0) and (Self.CookLevel < RAW_LEVELS[Self.Food]) then
+  begin
+    if not Self.IgnoreChecks then
+      raise Self.FoodName() + ' needs ' + ToStr(RAW_LEVELS[Self.Food]) + ' Cooking (you have ' + ToStr(Self.CookLevel) + ').';
+    Logger.Warn('DEBUG: ' + Self.FoodName() + ' needs ' + ToStr(RAW_LEVELS[Self.Food]) + ' Cooking - carrying on.');
+  end;
+
+  Logger.Info('Map: loading the areas (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  Map.Walker.ScreenWalk := False;
+
+  if Self.Nearest then
+  begin
+    Self.Place := PLACES[NearestPlace(RANGE_ONLY[Self.Food])];
+    Logger.Info('Nearest to where you stand (' + Here() + '): ' + Self.Place.Name + '.');
+  end;
+  Logger.Info('Food: ' + Self.FoodName() + '.');
+  if RANGE_ONLY[Self.Food] and FireOnly(Self.Place) then
+  begin
+    if not Self.IgnoreChecks then
+      raise Self.FoodName() + ' needs a range - ' + Self.Place.Name + ' only has a fire. Pick Lumbridge Castle or Al Kharid.';
+    Logger.Warn('DEBUG: ' + Self.FoodName() + ' needs a range, ' + Self.Place.Name + ' has a fire - carrying on.');
+  end;
+  Logger.Info('Place: ' + Self.Place.Name + ', bank: ' + Self.Place.BankName + '.');
+
+  if not Self.Place.Lumbridge then
+  begin
+    Self.HasBankObj := NearestObject(['Bank booth', 'Bank Booth', 'Bank chest'],
+                                     Tile(Self.Place.Bank.X, Self.Place.Bank.Y), 12, Self.BankObj);
+    if not Self.HasBankObj then
+      Logger.Warn('Bank: no booth near ' + Self.Place.BankName + ' - will use WaspLib''s nearest bank.');
+  end;
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.COOKING, ESkill.TOTAL];
+  SlowAntiban();
+  Logger.Info('Start: we are at ' + Here() + '.');
+end;
+
+// ---------------------------------------------------------------- bank
+
+procedure TCooker.OpenBank();
+var
+  dest: TPoint;
+  opened: Boolean;
+begin
+  UnselectItem();
+  if Self.Place.Lumbridge then
+    opened := OpenLumbridgeBank()
+  else
+  begin
+    if CurrentFloor() > 0 then
+      LeaveTopFloor();
+    dest := Tile(Self.Place.Bank.X, Self.Place.Bank.Y);
+    if Map.Position().DistanceTo(dest) > 6 * RSTranslator.TILE_SIZE then
+    begin
+      Logger.Info('Bank: walking to ' + Self.Place.BankName + ' (' +
+                  ToStr(Round(Map.Position().DistanceTo(dest) / RSTranslator.TILE_SIZE)) + ' tiles).');
+      SafeWebWalk(dest, 300000, 4);
+    end;
+    Logger.Info('Bank: opening the bank.');
+    GuardWalk(45000);
+    try
+      if Self.HasBankObj then
+        opened := Bank.Open(Self.BankObj, True)
+      else
+        opened := Bank.Open(True);
+    except
+      Logger.Warn('Bank: opening failed: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end;
+
+  if opened or Bank.IsOpen() then
+    Exit;
+  Inc(Self.Failures);
+  Logger.Warn('Bank: could not open the bank (we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + ').');
+  Sleep(1500, 2500);                 // don't use up the tries in a second
+  if Self.Failures >= 4 then
+    Self.StopReason := 'Could not open the ' + Self.Place.BankName + ' bank. Please post this log in a GitHub issue.';
+end;
+
+procedure TCooker.DoBank();
+var
+  got: Boolean;
+begin
+  Self.DebugTrip := False;
+  if Self.StartItems = [] then
+  begin
+    if Inventory.Slots.Count() > 0 then
+    begin
+      Logger.Info('Bank: depositing the food.');
+      Bank.DepositInventory();
+      SleepUntil(Inventory.Slots.Count() = 0, 100, 3000);
+    end;
+  end
+  else if Inventory.Items.ContainsDifferent(Self.StartItems) then
+  begin
+    Logger.Info('Bank: depositing the food (keeping your items).');
+    if Bank.DepositDifferent(Self.StartItems) then
+      SleepUntil(not Inventory.Items.ContainsDifferent(Self.StartItems), 100, 3000);
+  end;
+
+  // WaspLib's own bank withdraw (it finds the item itself); if that gets nothing, search the
+  // bank by name and pick it by its hover text
+  Logger.Info('Bank: taking out ' + Self.FoodName() + '.');
+  try
+    Bank.Withdraw(new TBankItem(Self.FoodName(), QUANTITY_ALL));
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  got := SleepUntil(Self.RawCount() > 0, 100, 3000);
+  if not got then
+  begin
+    Logger.Info('Bank: WaspLib''s withdraw got nothing - searching the bank for ' + Self.FoodName() + '.');
+    SearchAndWithdraw(Self.FoodName(), 'Withdraw-All');
+    got := Self.RawCount() > 0;
+  end;
+
+  if not got then
+  begin
+    if Self.IgnoreChecks then
+    begin
+      Logger.Warn('DEBUG: no raw food to take - walking to the ' + Self.Place.Name + ' range / fire anyway.');
+      Self.DebugTrip := True;
+    end
+    else
+    begin
+      Self.StopReason := 'The bank is out of ' + Self.FoodName() + '.';
+      Bank.Close();
+      Exit;
+    end;
+  end;
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  if not Self.DebugTrip then
+    Logger.Info('Bank: ' + ToStr(Self.RawCount()) + ' x ' + Self.FoodName() + '. Trip ' + ToStr(Self.Trips) + '. Off to cook.');
+  Bank.Close();
+  SleepUntil(not Bank.IsOpen(), 100, 3000);
+end;
+
+// ---------------------------------------------------------------- cooking
+
+// The cook menu is open: click the food (its hover hint names the cooked food, e.g. "Trout").
+// Only one choice -> click that one. The quantity is left as it is (All).
+function TCooker.ClickCookItem(): Boolean;
+var
+  boxes: TBoxArray;
+  b: TBox;
+begin
+  boxes := Make.GetItemBoxes();
+  for b in boxes do
+  begin
+    Mouse.Move(b);
+    if Make.WaitHint(1500) and (Pos(COOKED_HINTS[Self.Food], Lowercase(Make.ReadHint())) > 0) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+  if Length(boxes) = 1 then
+  begin
+    Mouse.Click(boxes[0], EMouseButton.LEFT);
+    Exit(True);
+  end;
+end;
+
+// The hand-added fire: stand next to it, hover its tile, click once the hover text says Cook / Fire.
+function TCooker.ClickHandFire(): Boolean;
+var
+  fire, pt, p: TPoint;
+  k: Integer;
+begin
+  fire := Tile(Self.Place.HandFire.X, Self.Place.HandFire.Y);
+  if Map.Position().DistanceTo(fire) > 3 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Info('Cook: walking to the fire.');
+    SafeWebWalk(Tile(Self.Place.HandStand.X, Self.Place.HandStand.Y), 120000, 1);
+    Map.Walker.WaitMoving();
+  end;
+  if not TileOnScreen(fire, pt) then
+  begin
+    Logger.Warn('Cook: the fire''s tile isn''t on the screen (we are at ' + Here() + ').');
+    Exit;
+  end;
+  for k := 0 to 14 do
+  begin
+    if (k = 5) or (k = 10) then
+    begin
+      // not seen from this angle: turn the camera a quarter turn and look again
+      Logger.Info('Cook: can''t see the fire from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(700, 1100);
+      if not TileOnScreen(fire, pt) then
+        Break;
+    end;
+    case k mod 5 of
+      0: p := pt;
+      1: p := Point(pt.X, pt.Y - 10);
+      2: p := Point(pt.X - 8, pt.Y - 5);
+      3: p := Point(pt.X + 8, pt.Y - 5);
+      4: p := Point(pt.X, pt.Y + 6);
+    end;
+    p := Point(p.X + Random(-2, 2), p.Y + Random(-2, 2));
+    if not MainScreen.Bounds.Contains(p) then
+      Continue;
+    Mouse.Move(p);
+    if MainScreen.IsUpText(['Cook', 'Fire', 'fire'], True, 0.85, 60) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+  Logger.Warn('Cook: no Cook / Fire hover text on the fire''s tile.');
+end;
+
+// A range / fire WaspLib knows: walk to it (with our time limit) and click it.
+function TCooker.ClickCooker(): Boolean;
+var
+  cooker: TObject;
+  hovered: Boolean;
+begin
+  UnselectItem();
+  if Self.HandFire() then
+    Exit(Self.ClickHandFire());
+
+  if CurrentFloor() > 0 then
+    if not LeaveTopFloor() then
+      Exit;
+  if Map.Position().DistanceTo(Self.CookTile()) > 10 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Info('Cook: walking to the ' + Self.Place.CookNames[0] + ' (' +
+                ToStr(Round(Map.Position().DistanceTo(Self.CookTile()) / RSTranslator.TILE_SIZE)) + ' tiles).');
+    SafeWebWalk(Self.CookTile(), 300000, 6);
+  end;
+  if not NearestObject(Self.Place.CookNames, Self.CookTile(), 15, cooker) then
+  begin
+    Logger.Warn('Cook: WaspLib knows no ' + Self.Place.CookNames[0] + ' near ' + Self.Place.Name + '.');
+    Exit;
+  end;
+  try
+    hovered := cooker.Hover(['Cook']);
+    if not hovered then
+    begin
+      GuardWalk(30000);
+      hovered := cooker.WalkHover(['Cook']);
+      WalkDeadline := 0;
+    end;
+  except
+    WalkDeadline := 0;
+    Logger.Warn('Cook: ' + GetExceptionMessage());
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Cook: could not hover the ' + Self.Place.CookNames[0] + '.');
+    Exit;
+  end;
+  Mouse.Click(EMouseButton.LEFT);
+  Result := True;
+end;
+
+procedure TCooker.DoCook();
+var
+  before, last: Integer;
+begin
+  if Self.DebugTrip then
+  begin
+    // debug: no food - just get there and back
+    if Self.HandFire() then
+      SafeWebWalk(Tile(Self.Place.HandStand.X, Self.Place.HandStand.Y), 300000, 3)
+    else
+    begin
+      if CurrentFloor() > 0 then
+        LeaveTopFloor();
+      SafeWebWalk(Self.CookTile(), 300000, 6);
+    end;
+    Logger.Warn('DEBUG: at the ' + Self.Place.Name + ' range / fire with no food - back to the bank.');
+    Self.DebugTrip := False;
+    Exit;
+  end;
+
+  before := Self.RawCount();
+  Logger.Info('Cook: ' + ToStr(before) + ' x ' + Self.FoodName() + ' - clicking the range / fire.');
+  if not Self.ClickCooker() then
+  begin
+    Inc(Self.CookFails);
+    Sleep(800, 1500);
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  // the cook menu: click the food (the quantity is already All)
+  if not Make.WaitOpen(5000) then
+  begin
+    Logger.Warn('Cook: the cook menu did not open.');
+    Inc(Self.CookFails);
+    Exit;
+  end;
+  if not Self.ClickCookItem() then
+  begin
+    Logger.Warn('Cook: could not find the ' + Self.FoodName() + ' in the cook menu.');
+    Inc(Self.CookFails);
+    Exit;
+  end;
+  Logger.Info('Cook: cooking the ' + Self.FoodName() + '.');
+
+  // it cooks one after another by itself; a level up stops it (then we click again)
+  repeat
+    last := Self.RawCount();
+    Activity.Restart();
+    if last = 0 then
+      Break;
+    if Chat.LeveledUp() then
+      Break;
+  until not SleepUntil(Self.RawCount() < last, 200, 6000);
+
+  Self.Cooked += before - Self.RawCount();
+  if Self.RawCount() < before then
+  begin
+    Self.CookFails := 0;
+    Logger.Info('Cook: cooked ' + ToStr(before - Self.RawCount()) + ', ' + ToStr(Self.RawCount()) + ' left.');
+  end
+  else
+  begin
+    Inc(Self.CookFails);
+    Logger.Warn('Cook: nothing got cooked.');
+  end;
+end;
+
+// ---------------------------------------------------------------- main loop
+
+function ReallyInWilderness(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InWilderness(Map.Position()) then
+      Exit(False);
+    if i < 3 then
+      Sleep(700, 900);
+  end;
+  Result := True;
+end;
+
+function TCooker.GetState(): ECookState;
+begin
+  if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+  begin
+    if Self.StopReason = '' then
+      Self.StopReason := 'Stopped at the Wilderness. Move the character out and restart.';
+    Exit(ECookState.STOP);
+  end;
+  if Self.StopReason <> '' then
+    Exit(ECookState.STOP);
+  if Self.CookFails >= 6 then
+  begin
+    Self.StopReason := 'Could not cook 6 times in a row. Please post this log in a GitHub issue.';
+    Exit(ECookState.STOP);
+  end;
+  if Activity.IsFinished then
+    Exit(ECookState.NO_ACTIVITY);
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+    Exit(ECookState.MAX_TIME);
+  if not Client.IsLoggedIn() then
+    Exit(ECookState.LOGIN);
+  if Chat.LeveledUp() then
+    Exit(ECookState.LEVEL_UP);
+  if Bank.IsOpen() then
+    Exit(ECookState.BANK);
+  if (Self.RawCount() > 0) or Self.DebugTrip then
+    Exit(ECookState.COOK);
+  Result := ECookState.OPEN_BANK;
+end;
+
+procedure TCooker.Run();
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      ECookState.LOGIN: DoLoginSafe();
+      ECookState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+          Self.CookLevel := Max(Self.CookLevel, Stats.GetLevel(ESkill.COOKING, False));
+          Logger.Info('Level up! Cooking ' + ToStr(Self.CookLevel) + '.');
+          Inventory.Open();
+        end;
+      ECookState.OPEN_BANK: Self.OpenBank();
+      ECookState.BANK: Self.DoBank();
+      ECookState.COOK: Self.DoCook();
+      ECookState.NO_ACTIVITY, ECookState.MAX_TIME, ECookState.STOP: Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  if Self.StopReason <> '' then
+    Logger.Error('Stopped: ' + Self.StopReason)
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+// ---------------------------------------------------------------- settings window
+
+var
+  Cooker: TCooker;
+  CookForm: TScriptForm;
+  GuiCookLevel: Integer;
+  RuntimeEdit: TLazEdit;
+  PlaceSelector, FoodSelector: TLazComboBox;
+  DebugBox: TLazCheckBox;
+  StartLocked: String;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes, pick: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Cooker.MaxTime := minutes * MINUTE;
+
+  pick := Max(0, PlaceSelector.ItemIndex);
+  Cooker.Nearest := pick = 0;
+  if pick > 0 then
+    Cooker.Place := PLACES[pick - 1];
+
+  Cooker.Food := Max(0, FoodSelector.ItemIndex);
+
+  Cooker.IgnoreChecks := DebugBox.Checked;
+  StartLocked := '';
+  if (not Cooker.IgnoreChecks) and (GuiCookLevel > 0) and
+     (GuiCookLevel < RAW_LEVELS[Cooker.Food]) then
+    StartLocked := 'needs ' + ToStr(RAW_LEVELS[Cooker.Food]) + ' Cooking (you have ' + ToStr(GuiCookLevel) + ')';
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i: Integer;
+  line: String;
+begin
+  if GuiCookLevel > 0 then
+    Self.Setup('DMB''s F2P Cooker - Cooking ' + ToStr(GuiCookLevel))
+  else
+    Self.Setup('DMB''s F2P Cooker');
+  tab := Self.CreateTab('Cooker');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run, in minutes.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  PlaceSelector := TLazComboBox.CreateEx(tab, 'Where:', 'Where to cook. The bot walks there from wherever you are.', 40, 110, 420);
+  PlaceSelector.Items.Add('Nearest (to where you stand at Start)');
+  for i := 0 to High(PLACES) do
+    PlaceSelector.Items.Add(PLACES[i].Name + ' (bank: ' + PLACES[i].BankName + ')');
+  PlaceSelector.ItemIndex := 0;
+
+  FoodSelector := TLazComboBox.CreateEx(tab, 'Food:', 'What to cook. It must be in your bank.', 40, 180, 420);
+  for i := 0 to High(RAW_NAMES) do
+  begin
+    line := RAW_NAMES[i] + ' (Cooking ' + ToStr(RAW_LEVELS[i]) + ')';
+    if RANGE_ONLY[i] then
+      line += ' - range only';
+    if (GuiCookLevel > 0) and (GuiCookLevel < RAW_LEVELS[i]) then
+      line += ' - LOCKED';
+    FoodSelector.Items.Add(line);
+  end;
+  FoodSelector.ItemIndex := 0;
+
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the level and item checks',
+    'For testing the walking only. LOCKED food starts anyway, and no raw food only gives a warning: it still walks to the range / fire and back to the bank, round and round.', 40, 250);
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  SetupPlaces();
+
+  Logger.Info('Reading your Cooking level before opening the settings...');
+  try
+    if not Client.IsLoggedIn() then
+      DoLoginSafe();
+    GuiCookLevel := Stats.GetLevel(ESkill.COOKING, False);
+    Inventory.Open();
+  except
+    Logger.Warn('Could not read the Cooking level: ' + GetExceptionMessage());
+  end;
+
+  CookForm.Init();
+  SetClientInputLocked(True);
+  try
+    if StartLocked <> '' then
+      Logger.Error(RAW_NAMES[Cooker.Food] + ' is locked: ' + StartLocked +
+                   '. Pick other food (or tick the debug box to run it anyway).')
+    else
+      Cooker.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

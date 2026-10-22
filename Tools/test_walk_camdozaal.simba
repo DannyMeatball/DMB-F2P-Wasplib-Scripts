@@ -1,0 +1,194 @@
+{$I WaspLib/main.simba}
+
+// TEST WALKER: Varrock -> Ruins of Camdozaal bank chest, using only WaspLib.
+// It never banks or fights. Start it anywhere on the surface between Varrock and Ice Mountain.
+// It logs everything, so if something fails, post the whole log in a GitHub issue.
+//
+//   Step 1: WaspLib's walker straight to the Camdozaal chest. (My guess: this fails, because
+//           WaspLib's walking graph has no link between the surface and the underground ruins.)
+//   Step 2: list every object WaspLib knows near the Camdozaal entrance on the west side of
+//           Ice Mountain that has an "Enter"-type option, and walk to the most likely one.
+//   Step 3: click it, wait to arrive underground.
+//   Step 4: WaspLib's walker to the bank chest.
+
+var
+  CHEST_SPOT: TPoint = [11912, 27238];       // Camdozaal bank chest (from your golem script)
+  ENTRANCE_GUESS: TPoint = [11984, 36454];   // west side of Ice Mountain (estimate, game 2996, 3494)
+
+  ENTER_ACTIONS: TStringArray = ['Enter', 'Climb-down', 'Go-down', 'Go-through', 'Pass',
+                                 'Squeeze-through', 'Crawl-through', 'Walk-down', 'Descend'];
+
+  WalkDeadline, WalkLogAt: UInt64;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+  end;
+end;
+
+function SafeWebWalk(dest: TPoint; ms: Integer): Boolean;
+begin
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    Result := Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+    Result := False;
+  end;
+  WalkDeadline := 0;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+function InCamdozaal(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := ((me.X <> 0) or (me.Y <> 0)) and (me.DistanceTo(CHEST_SPOT) <= 80 * RSTranslator.TILE_SIZE);
+end;
+
+function JoinActions(a: TStringArray): String;
+var
+  s: String;
+begin
+  for s in a do
+    if s <> '' then
+      Result += s + '/';
+end;
+
+var
+  all: TMapObjectDataArray;
+  best: TMapObjectData;
+  action: String;
+  bestAction: String;
+  i, j, bestJ: Integer;
+  d, bestD: Double;
+  obj: TObject;
+begin
+  Logger.Setup('Camdozaal Walk Test');
+
+  if not Client.IsLoggedIn() then
+    Login.DoLogin();
+  StartListeners(300);
+
+  // same areas as essence_mindrunes.simba
+  Map.Setup([
+    Chunk(Box(45, 55, 52, 52), 0),
+    Chunk(Box(44, 77, 47, 74), 0),
+    Chunk(Box(44, 92, 48, 88), 0),
+    Chunk(Box(43, 76, 43, 75), 0)
+  ]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+
+  Logger.Info('Start: we are at ' + Here() + '.');
+
+  // ---------------------------------------------------------------- step 1
+  Logger.Info('STEP 1: WaspLib''s walker straight to the Camdozaal chest.');
+  SafeWebWalk(CHEST_SPOT, 360000);
+  if InCamdozaal() then
+  begin
+    Logger.Info('STEP 1 RESULT: WaspLib walked all the way into Camdozaal by itself! We are at ' + Here() + '.');
+    Exit;
+  end;
+  Logger.Info('STEP 1 RESULT: WaspLib could not walk into Camdozaal on its own. We are at ' + Here() + '.');
+
+  // ---------------------------------------------------------------- step 2
+  Logger.Info('STEP 2: objects near the west side of Ice Mountain with an enter-type option:');
+  bestD := 1000000000;
+  bestJ := -1;
+  for action in ENTER_ACTIONS do
+  begin
+    try
+      all := MapObjects.GetByAction(action);
+    except
+      Continue;
+    end;
+
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(ENTRANCE_GUESS) / RSTranslator.TILE_SIZE;
+        if d > 40 then
+          Continue;
+
+        Logger.Info('  "' + all[i].Name + '" (' + JoinActions(all[i].Actions) + ') at [' +
+                    ToStr(all[i].Coordinates[j].X) + ', ' + ToStr(all[i].Coordinates[j].Y) + '], ' +
+                    ToStr(Round(d)) + ' tiles from my guess.');
+
+        if d < bestD then
+        begin
+          bestD := d;
+          best := all[i];
+          bestJ := j;
+          bestAction := action;
+        end;
+      end;
+  end;
+
+  if bestJ = -1 then
+  begin
+    Logger.Error('STEP 2 RESULT: WaspLib knows no enter-type object near Ice Mountain. Please post this log in a GitHub issue, ' +
+                 'plus your coordinate (coordinate_finder_mindrunes) standing at the entrance and its hover text.');
+    Exit;
+  end;
+
+  Logger.Info('STEP 2 RESULT: best guess is "' + best.Name + '" (' + bestAction + ') at [' +
+              ToStr(best.Coordinates[bestJ].X) + ', ' + ToStr(best.Coordinates[bestJ].Y) + '].');
+
+  best.Coordinates := [best.Coordinates[bestJ]];
+  if bestJ <= High(best.Rotations) then
+    best.Rotations := [best.Rotations[bestJ]];
+  obj := TObject.Create(Map.Walker, best);
+
+  Logger.Info('Walking to it.');
+  SafeWebWalk(best.Coordinates[0], 360000);
+  Logger.Info('Now at ' + Here() + ', ' + ToStr(Round(Map.Position().DistanceTo(best.Coordinates[0]) / RSTranslator.TILE_SIZE)) + ' tiles from it.');
+
+  // ---------------------------------------------------------------- step 3
+  Logger.Info('STEP 3: clicking "' + bestAction + '" on it.');
+  try
+    if obj.WalkInteract([bestAction]) then
+      Logger.Info('Clicked.')
+    else
+      Logger.Warn('WaspLib says the click failed, checking anyway.');
+  except
+    Logger.Warn('Click failed: ' + GetExceptionMessage());
+  end;
+
+  Map.Walker.WaitMoving();
+  if not SleepUntil(InCamdozaal(), 300, 12000) then
+  begin
+    Logger.Error('STEP 3 RESULT: not in Camdozaal after clicking. We are at ' + Here() + '. ' +
+                 'Hover the real entrance and post its top-left text in a GitHub issue.');
+    Exit;
+  end;
+  Logger.Info('STEP 3 RESULT: we are inside Camdozaal at ' + Here() + '.');
+
+  // ---------------------------------------------------------------- step 4
+  Logger.Info('STEP 4: WaspLib''s walker to the bank chest.');
+  SafeWebWalk(CHEST_SPOT, 120000);
+  d := Map.Position().DistanceTo(CHEST_SPOT) / RSTranslator.TILE_SIZE;
+  if d <= 4 then
+    Logger.Info('STEP 4 RESULT: at the Camdozaal bank chest. The whole walk works!')
+  else
+    Logger.Warn('STEP 4 RESULT: stopped ' + ToStr(Round(d)) + ' tiles from the chest, at ' + Here() + '.');
+end.

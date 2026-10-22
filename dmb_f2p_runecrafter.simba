@@ -1,0 +1,1921 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =====================================================================================
+//  DMB's F2P Runecrafter                                     Simba 2.0 + WaspLib
+// =====================================================================================
+// FILES (all in Scripts\)
+//   dmb_f2p_runecrafter.simba this script
+//   Logs go to Data\Logs\DMB's F2P Runecrafter\
+//
+// HOW TO USE
+//   Put rune essence in the bank. Wear the altar's tiara, or carry its talisman (it takes one
+//   out of the bank if you have neither). Start it logged in (or at the login screen). It
+//   reads your Runecrafting level, then opens the settings window. Pick the altar, press Start.
+//   Then, round and round:
+//     bank -> take out the essence -> walk to the altar's ruins -> Enter (tiara) or use the
+//     talisman on them -> "Craft-rune" on the altar -> out through the portal -> bank.
+//   While it runs, RuneLite ignores your own mouse and keyboard.
+//
+// ALTAR     LEVEL   BANK                      RUINS (game tile)
+//   Air       1     Falador East              south of Falador
+//   Mind      2     Ruins of Camdozaal chest  north of Falador, by Ice Mountain (the chest is
+//                                             under Ice Mountain: in through "Ruins entrance")
+//   Water     5     Lumbridge Castle (top)    Lumbridge Swamp
+//   Earth     9     Varrock East              north-east of Varrock
+//   Fire     14     Al Kharid                 north-east of Al Kharid
+//   Body     20     Edgeville                 south of Edgeville
+//   Altars you lack the Runecrafting level for say LOCKED in the settings and won't start.
+//   The ruins, the altar and the portal are WaspLib's own objects; the tiles below are only
+//   where to look for them. (Untested: if one isn't found, the log says so - send it to me.)
+//
+// ITEMS: whatever you carry at Start (except essence and runes) is yours: never banked. The
+//   talisman is never banked. The runes you make are banked each trip.
+//
+// DEBUG (tick "Debug: turn off the level and item checks") - for testing the walking:
+//   a LOCKED altar starts anyway; no essence / no talisman or tiara only give a warning: it
+//   still walks to the ruins and back to the bank, round and round.
+//
+// SAFETY: never into the Wilderness; every walk has a time limit and an 8 s stuck check; the
+//   Al Kharid toll gate and the Lumbridge stairs are handled; misclicked windows are closed;
+//   it logs back in after a disconnect.
+// =====================================================================================
+
+type
+  TAltarSite = record
+    Name, Rune, Talisman, Tiara, BankName: String;
+    Level: Integer;
+    Bank, Ruins, Altar: TPoint;     // game tiles: the bank, the ruins, the altar inside
+    Lumbridge, AlKharid, Camdozaal: Boolean;
+  end;
+
+  ERCState = enum(LOGIN, LEVEL_UP, OPEN_BANK, BANK, TO_RUINS, ENTER, CRAFT, LEAVE, NO_ACTIVITY, MAX_TIME, STOP);
+
+const
+  ANTIBAN_SLOWDOWN = 3;
+  TOLL_COINS = 10;
+
+var
+  ALTARS: array of TAltarSite;
+  ESSENCE: TStringArray = ['Rune essence', 'Pure essence'];
+
+  // Lumbridge Castle (tested in the miner and fisher): ground-floor staircase, top floor
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // game (3206, 3209)
+  TOP_STAIRS: TPoint = [64032, 37590];
+  TOP_BANK: TPoint = [64036, 37550];
+
+  // walker watchdog
+  WalkDeadline, WalkLogAt, WalkStallSince: UInt64;
+  WalkStallSpot: TPoint;
+  WildernessHit: Boolean;
+
+  // the chosen altar, in map pixels (set when the map loads) - InAltarRoom checks we are near it
+  ALTAR_SPOT: TPoint;
+
+procedure AddAltar(name: String; level: Integer; bankName: String; bx, by, rx, ry, ax, ay: Integer; lumbridge, alKharid: Boolean);
+var
+  a: TAltarSite;
+begin
+  a.Name := name;
+  a.Rune := name + ' rune';
+  a.Talisman := name + ' talisman';
+  a.Tiara := name + ' tiara';
+  a.Level := level;
+  a.BankName := bankName;
+  a.Bank := Point(bx, by);
+  a.Ruins := Point(rx, ry);
+  a.Altar := Point(ax, ay);
+  a.Lumbridge := lumbridge;
+  a.AlKharid := alKharid;
+  ALTARS += a;
+end;
+
+// Bank tiles are the ones the other scripts use. Mind's ruins/altar are from your old
+// essence_mindrunes script (tested); the others are from the game map and only need to be
+// close - WaspLib finds the real ruins / altar / portal near them.
+procedure SetupAltars();
+begin
+  AddAltar('Air',    1, 'Falador East',               3013, 3356,  2985, 3292,  2843, 4834, False, False);
+  // Mind: banks at the Ruins of Camdozaal chest, under Ice Mountain (from your old script)
+  AddAltar('Mind',   2, 'Ruins of Camdozaal',         2978, 5798,  2982, 3514,  2786, 4841, False, False);
+  ALTARS[High(ALTARS)].Camdozaal := True;
+  AddAltar('Water',  5, 'Lumbridge Castle (top floor)', 3206, 3209, 3185, 3165,  2716, 4836, True,  False);
+  AddAltar('Earth',  9, 'Varrock East',               3253, 3421,  3306, 3474,  2658, 4841, False, False);
+  AddAltar('Fire',  14, 'Al Kharid',                  3270, 3167,  3313, 3255,  2585, 4838, False, True);
+  AddAltar('Body',  20, 'Edgeville',                  3094, 3492,  3053, 3445,  2521, 4842, False, False);
+end;
+
+// ---------------------------------------------------------------- helpers (from the miner/fisher)
+
+// Game tile -> WaspLib map pixels (the same numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// North of the Wilderness ditch (game y 3523 and up)? Map pixels.
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+// East of the Lumbridge / Al Kharid fence?
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // never into the Wilderness (a destination hundreds of tiles away is a bad point from
+  // WaspLib's walker, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  // stuck against something: not moved a tile in 8 s -> stop
+  if WalkDeadline > 0 then
+  begin
+    if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+    begin
+      WalkStallSpot := position;
+      WalkStallSince := GetTimeRunning();
+    end
+    else if GetTimeRunning() - WalkStallSince > 8000 then
+    begin
+      Logger.Warn('Walk: not moved for 8 s at [' + ToStr(position.X) + ', ' + ToStr(position.Y) +
+                  '] (stuck on something), stopping this walk.');
+      walker^.Walking := False;
+      WalkDeadline := 0;
+    end;
+  end;
+end;
+
+// Start the watchdog's time limit + stall check for a walk WaspLib does itself (bank, furnace).
+procedure GuardWalk(ms: Integer);
+begin
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+end;
+
+// WaspLib's walker with a time limit. True when we end within `reachTiles` of `dest`.
+function WebWalkRaw(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  if InWilderness(dest) then
+  begin
+    Logger.Error('Walk: refusing to walk into the Wilderness.');
+    WildernessHit := True;
+    Exit(False);
+  end;
+
+  GuardWalk(ms);
+  try
+    // fill in a point every 10 tiles: the minimap only reaches ~15 tiles
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// Minimap click `tiles` tiles away in a world direction (dx east, dy north = -1...).
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Logger.Warn('WaspLib objects: looking up "' + name + '" failed: ' + GetExceptionMessage());
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if bj = -1 then
+  begin
+    Logger.Warn('WaspLib objects: no "' + names[0] + '" in the loaded map at all.');
+    Exit(False);
+  end;
+  if best > maxTiles * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('WaspLib objects: nearest "' + single.Name + '" is ' + ToStr(Round(best / RSTranslator.TILE_SIZE)) +
+                ' tiles away (want ' + ToStr(maxTiles) + ').');
+    Exit(False);
+  end;
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Result := True;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+// Use the staircase WaspLib knows next to `spot`. `wanted` are bits of the menu line to pick,
+// best first (the menu reader garbles letters, so short bits: 'op-floor', 'limb-up'...). The
+// first menu line containing the earliest bit wins. The log says which line it clicked.
+function UseStaircase(spot: TPoint; wanted: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, w: String;
+  hovered, found: Boolean;
+begin
+  if NearestObject(['Staircase'], spot, 6, stairs) then
+    try
+      hovered := stairs.Hover([]);
+      if not hovered then
+        hovered := stairs.WalkHover([]);
+    except
+      Logger.Warn('Stairs: ' + GetExceptionMessage());
+    end
+  else
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  found := False;
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+
+  if not found then
+  begin
+    Logger.Warn('Stairs: none of ' + ToStr(wanted) + ' in the menu. It says: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Sleep(2500, 3500);
+  Result := True;
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+procedure SlowAntiban();
+var
+  i: Integer;
+begin
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+end;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// Coins in the inventory: the size of the stack (Count would only count the slots).
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= TOLL_COINS then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// An inventory item selected ("Use Burnt fish -> ...")? Then every click on the bank or the
+// range turns into "use the item on it" and fails. Click the item again to unselect it.
+procedure UnselectItem();
+var
+  sel: Integer;
+begin
+  try
+    sel := Inventory.GetSelected();
+  except
+    Exit;
+  end;
+  if sel < 0 then
+    Exit;
+  Logger.Info('An item in the inventory was selected (slot ' + ToStr(sel + 1) + ') - unselecting it.');
+  Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+  SleepUntil(Inventory.GetSelected() < 0, 100, 1500);
+  Mouse.Move(Point(MainScreen.Bounds.Center.X + Random(-80, 80), MainScreen.Bounds.Center.Y + Random(-60, 60)));
+end;
+
+// ---------------------------------------------------------------- Lumbridge Castle bank
+
+// ---------------------------------------------------------------- Al Kharid toll gate (from the smelter)
+// Any walk that crosses the Lumbridge / Al Kharid fence goes through the toll gate first, by
+// trying it: "Open" (free with Prince Ali Rescue), the guard / "Pay-toll" with 10+ coins,
+// turning the camera if the gate can't be seen. Not let through: the long way round the fence.
+
+var
+  TOLL_GATE: TPoint = [13068, 37522];
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+  // the long way round the fence (no coins, no Prince Ali Rescue), game tiles
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+// Coins in the inventory (the stack size).
+function GateCoins(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= 10 then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free).
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through: we can't get through here (the caller walks the long way round).
+function CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not WebWalkRaw(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := GateCoins();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= 10 then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if GateMenu(gate, ['oll', 'Pay'], menu) then
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+    begin
+      Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+  // 4) no way through here
+  if coins < 10 then
+    Logger.Warn('Gate: not let through and fewer than 10 coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence (when the toll gate doesn't let us through).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not WebWalkRaw(path[0], 240000, 4) then
+      Exit;
+  end;
+
+  Logger.Info('Long way: walking round the fence.');
+  for i := start to High(path) do
+    if not WebWalkRaw(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+      Exit;
+    end;
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+end;
+
+// WaspLib's walker with our time limit, through the toll gate first when the walk crosses the
+// Lumbridge / Al Kharid fence. True when we end within `reachTiles` of `dest`.
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  me: TPoint;
+  into: Boolean;
+begin
+  me := Map.Position();
+  if (me.X <> 0) and (me.X < RSTranslator.MapWidth) and (dest.X < RSTranslator.MapWidth) and
+     (InAlKharid(me) <> InAlKharid(dest)) and not InWilderness(dest) then
+  begin
+    into := InAlKharid(dest);
+    if not CrossTollGate() then
+    begin
+      Logger.Info('Walk: the toll gate is no good - taking the long way round the fence.');
+      if not WalkLongWay(into) then
+      begin
+        Logger.Warn('Walk: could not get past the Al Kharid fence (toll gate or the long way).');
+        Exit(False);
+      end;
+    end;
+  end;
+  CloseStrayInterface(True);
+  Result := WebWalkRaw(dest, ms, reachTiles);
+  // a window popped up during the walk (misclick): close it and walk again, once
+  if (not Result) and CloseStrayInterface(True) then
+  begin
+    Logger.Info('Walk: a window was in the way - closed it, walking again.');
+    Result := WebWalkRaw(dest, ms, reachTiles);
+  end;
+end;
+
+
+function OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+begin
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 180000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['op-floor', 'top floor', 'floor', 'limb-up', 'limb-u']) then
+      Exit;
+    SleepUntil(CurrentFloor() in [1, 2], 300, 6000);
+    if CurrentFloor() = 1 then
+    begin
+      Logger.Info('Bank: on the middle floor - climbing up once more.');
+      UseStaircase(Point(LUMBRIDGE_STAIRS.X + RSTranslator.MapWidth, LUMBRIDGE_STAIRS.Y), ['limb-up', 'limb-u', 'op-floor']);
+      SleepUntil(CurrentFloor() = 2, 300, 6000);
+    end;
+    if CurrentFloor() <> 2 then
+    begin
+      Logger.Warn('Bank: not on the top floor after climbing (we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + ').');
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: opening the top-floor bank booth.');
+  if not NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+    Exit;
+  // just off the stairs WaspLib can give up straight away: settle first
+  Map.Walker.WaitMoving();
+  UnselectItem();
+  Sleep(600, 1000);
+  GuardWalk(45000);
+  try
+    Result := Bank.Open(booth, True);
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  if Result or Bank.IsOpen() then
+    Exit(True);
+
+  // didn't open: walk over to the booths ourselves, then try again
+  Logger.Info('Bank: did not open from the stairs - walking to the booths and trying again.');
+  SafeWebWalk(TOP_BANK, 30000, 2);
+  Map.Walker.WaitMoving();
+  Sleep(400, 800);
+  GuardWalk(30000);
+  try
+    Result := Bank.Open(booth, True);
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Result or Bank.IsOpen();
+end;
+
+function LeaveTopFloor(): Boolean;
+begin
+  Logger.Info('Travel: down the Lumbridge Castle stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  if UseStaircase(TOP_STAIRS, ['ottom-floor', 'ottom', 'floor', 'limb-down', 'limb-d']) then
+    SleepUntil(CurrentFloor() in [0, 1], 300, 6000);
+  if CurrentFloor() = 1 then
+  begin
+    Logger.Info('Travel: on the middle floor - climbing down once more.');
+    UseStaircase(Point(TOP_STAIRS.X - RSTranslator.MapWidth, TOP_STAIRS.Y), ['limb-down', 'limb-d', 'ottom']);
+    SleepUntil(CurrentFloor() = 0, 300, 6000);
+  end;
+  Result := CurrentFloor() = 0;
+end;
+
+
+// ---------------------------------------------------------------- bank search (from the smither)
+
+// The bank is showing search results: take the first slot whose hover text names `item`,
+// right-click it and pick Withdraw-All (or Withdraw-1 for the hammer).
+function WithdrawFromResults(item, option: String): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to 7 do
+  begin
+    Mouse.Move(Bank.Slots.Box(i));
+    Sleep(150, 300);
+    if Pos(item, MainScreen.UpText) = 0 then
+      Continue;
+    Mouse.Click(EMouseButton.RIGHT);
+    if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+      Continue;
+    Sleep(150, 350);
+    if ChooseOption.Select([option, Lowercase(option)]) then
+      Exit(True);
+    CancelMenu();
+  end;
+end;
+
+// Search the bank for `item` and withdraw it from the results. True when the inventory grew.
+function SearchAndWithdraw(item, option: String): Boolean;
+var
+  before: Integer;
+begin
+  before := Inventory.Slots.Count();
+  if not Bank.Search(item) then
+    Logger.Warn('Bank: search for ' + item + ' did not work.');
+  if not WithdrawFromResults(item, option) then
+    Logger.Warn('Bank: no ' + item + ' in the search results.');
+  Result := SleepUntil(Inventory.Slots.Count() > before, 100, 3000);
+  Bank.ClearSearch();
+end;
+
+// Where a tile (map pixels) is on the game screen, from where we stand.
+function TileOnScreen(tile: TPoint; out pt: TPoint): Boolean;
+var
+  mm: TPoint;
+begin
+  mm := TWalker.Point2MM(Map.Position(), tile, Minimap.CompassRadians);
+  pt := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  Result := MainScreen.Bounds.Contains(pt);
+end;
+
+
+// Inside an altar? (The altar rooms are far north on the map: game y 4700+.)
+function InAltarRoom(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(False);
+  Result := ((50430 - me.Y) div 4 >= 4700) and ((50430 - me.Y) div 4 < 5000);
+  // WaspLib can mistake the outside for an altar room (it once put us by the Mind altar while
+  // walking from Camdozaal to Edgeville) - only believe it when we are near our own altar
+  if Result and ((ALTAR_SPOT.X <> 0) or (ALTAR_SPOT.Y <> 0)) then
+    Result := me.DistanceTo(ALTAR_SPOT) <= 240;   // 60 tiles
+end;
+
+// ---------------------------------------------------------------- Ruins of Camdozaal (Mind)
+// From your old essence_mindrunes script (tested): the entrance on the west side of Ice
+// Mountain, where you arrive inside (the "Ruins exit" is right there), your walk from there to
+// the bank chest. Map pixels.
+var
+  CAMDO_ENTRANCE: TPoint = [11992, 36454];   // standing at the entrance, game (2998, 3494)
+  CAMDO_ARRIVAL: TPoint = [11808, 27382];    // inside, where you arrive
+  CAMDO_CHEST: TPoint = [11912, 27238];      // the bank chest
+  CAMDO_ROUTE: TPointArray = [
+    [11808, 27382], [11808, 27358], [11808, 27334], [11808, 27310], [11804, 27286], [11804, 27262],
+    [11828, 27250], [11852, 27250], [11876, 27246], [11900, 27242], [11912, 27238]
+  ];
+
+// Inside the Ruins of Camdozaal?
+function InCamdozaal(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := ((me.X <> 0) or (me.Y <> 0)) and (me.X < RSTranslator.MapWidth) and
+            (me.DistanceTo(CAMDO_CHEST) <= 80 * RSTranslator.TILE_SIZE);
+end;
+
+// Hover points around a spot on the screen until the hover text has one of `texts`, then
+// click. True when clicked.
+function ClickByHover(center: TPoint; texts: TStringArray): Boolean;
+var
+  k: Integer;
+  p: TPoint;
+begin
+  for k := 0 to 24 do
+  begin
+    p := Point(center.X + (k mod 5 - 2) * 18 + Random(-3, 3), center.Y + (k div 5 - 2) * 14 + Random(-3, 3));
+    if not MainScreen.Bounds.Contains(p) then
+      Continue;
+    Mouse.Move(p);
+    if MainScreen.IsUpText(texts, True, 0.8, 60) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+end;
+
+// Through a door-like object at `spot`: WaspLib's object first (action `action`), otherwise by
+// its hover text on the screen around it.
+function UsePassage(names: TStringArray; spot: TPoint; action: String; hoverTexts: TStringArray): Boolean;
+var
+  obj: TObject;
+  pt: TPoint;
+begin
+  CloseStrayInterface(True);
+  if NearestObject(names, spot, 8, obj) then
+  begin
+    try
+      Result := obj.Interact([action]);
+    except
+      Logger.Warn('Camdozaal: ' + GetExceptionMessage());
+    end;
+    if Result then
+      Exit;
+    if TileOnScreen(obj.Coordinates[0], pt) then
+      Exit(ClickByHover(pt, hoverTexts));
+  end;
+  if TileOnScreen(spot, pt) then
+    Result := ClickByHover(pt, hoverTexts)
+  else
+    Result := ClickByHover(MainScreen.Bounds.Center, hoverTexts);
+end;
+
+// Down into the ruins: walk to the entrance, "Enter".
+function EnterCamdozaal(): Boolean;
+begin
+  if InCamdozaal() then
+    Exit(True);
+  if CurrentFloor() > 0 then
+    LeaveTopFloor();
+  if Map.Position().DistanceTo(CAMDO_ENTRANCE) > 3 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Info('Camdozaal: walking to the entrance (' +
+                ToStr(Round(Map.Position().DistanceTo(CAMDO_ENTRANCE) / RSTranslator.TILE_SIZE)) + ' tiles).');
+    SafeWebWalk(CAMDO_ENTRANCE, 300000, 2);
+    Map.Walker.WaitMoving();
+  end;
+  Logger.Info('Camdozaal: entering the ruins.');
+  UsePassage(['Ruins entrance', 'Ruins Entrance', 'Entrance'], CAMDO_ENTRANCE, 'Enter',
+             ['Enter Ruins', 'Ruins entrance', 'Ruins Entrance', 'uins ent']);
+  Map.Walker.WaitMoving();
+  Result := SleepUntil(InCamdozaal(), 300, 12000);
+  if Result then
+  begin
+    Logger.Info('Camdozaal: inside.');
+    Sleep(800, 1400);
+  end
+  else
+    Logger.Warn('Camdozaal: did not get inside (we are at ' + Here() + ').');
+end;
+
+// Back up: walk to the exit (where you arrived), "Exit".
+function LeaveCamdozaal(): Boolean;
+var
+  path: TPointArray;
+  i: Integer;
+begin
+  if not InCamdozaal() then
+    Exit(True);
+  if Map.Position().DistanceTo(CAMDO_ARRIVAL) > 4 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Info('Camdozaal: walking to the exit.');
+    SafeWebWalk(CAMDO_ARRIVAL, 60000, 3);
+    if Map.Position().DistanceTo(CAMDO_ARRIVAL) > 4 * RSTranslator.TILE_SIZE then
+    begin
+      // your recorded route, backwards
+      for i := High(CAMDO_ROUTE) downto 0 do
+        path += CAMDO_ROUTE[i];
+      GuardWalk(60000);
+      try
+        Map.Walker.WalkPath(path, 4);
+      except
+      end;
+      WalkDeadline := 0;
+    end;
+  end;
+  Logger.Info('Camdozaal: leaving the ruins.');
+  UsePassage(['Ruins exit', 'Ruins Exit', 'Exit'], CAMDO_ARRIVAL, 'Exit',
+             ['Exit Ruins', 'Ruins exit', 'Ruins Exit', 'uins ex']);
+  Map.Walker.WaitMoving();
+  Result := SleepUntil(not InCamdozaal(), 300, 12000);
+  if Result then
+  begin
+    Logger.Info('Camdozaal: back outside.');
+    Sleep(800, 1400);
+  end
+  else
+    Logger.Warn('Camdozaal: still inside after the exit (we are at ' + Here() + ').');
+end;
+
+// To the chest inside: WaspLib's walker, your recorded route if that doesn't get there.
+procedure WalkToCamdoChest();
+begin
+  if Map.Position().DistanceTo(CAMDO_CHEST) <= 4 * RSTranslator.TILE_SIZE then
+    Exit;
+  Logger.Info('Camdozaal: walking to the bank chest.');
+  SafeWebWalk(CAMDO_CHEST, 60000, 3);
+  if Map.Position().DistanceTo(CAMDO_CHEST) > 4 * RSTranslator.TILE_SIZE then
+  begin
+    GuardWalk(60000);
+    try
+      Map.Walker.WalkPath(CAMDO_ROUTE, 4);
+    except
+    end;
+    WalkDeadline := 0;
+  end;
+end;
+
+// ---------------------------------------------------------------- the runecrafter
+
+type
+  TCrafter = record
+    MaxTime: UInt64;
+    Site: TAltarSite;
+    IgnoreChecks: Boolean;          // debug
+    RCLevel: Integer;
+    BankObj: TObject;
+    HasBankObj: Boolean;
+    TiaraWorn: Boolean;
+    DebugTrip: Boolean;             // debug: no essence, walk to the ruins and back anyway
+    Runes, Trips, Failures, AltarFails: Integer;
+    StartItems: TItemArray;         // (no longer used: everything is banked at the start)
+    FirstBank: Boolean;             // bank the whole inventory before the first trip
+    StopReason: String;
+    State: ERCState;
+  end;
+
+function TCrafter.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Self.Site.Name + ' altar',
+    ToStr(Self.Runes),
+    FormatNumber(Self.Runes / Logger.TimeRunning.Elapsed * HOUR),
+    ToStr(Self.Trips),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+function EssenceCount(): Integer;
+var
+  e: String;
+begin
+  for e in ESSENCE do
+    Result += Inventory.Items.Count(e);
+end;
+
+function TCrafter.HasTalisman(): Boolean;
+begin
+  Result := Inventory.Items.Count(Self.Site.Talisman) > 0;
+end;
+
+function TCrafter.KeepItems(): TItemArray;
+begin
+  Result := [];
+  Result += Self.Site.Talisman;
+  Result += Self.Site.Tiara;
+  Result += Self.StartItems;
+end;
+
+function TCrafter.RuinsTile(): TPoint;
+begin
+  Result := Tile(Self.Site.Ruins.X, Self.Site.Ruins.Y);
+end;
+
+function TCrafter.AltarTile(): TPoint;
+begin
+  Result := Tile(Self.Site.Altar.X, Self.Site.Altar.Y);
+end;
+
+// Everything at the start except essence and runes is yours to keep: never banked.
+procedure TCrafter.RememberStartItems();
+var
+  item, k: TItem;
+  e: String;
+  skip: Boolean;
+begin
+  Self.StartItems := [];
+  for item in Inventory.Items.RecognizeAll() do
+  begin
+    if item = '' then
+      Continue;
+    skip := Pos(' rune', Lowercase(item)) > 0;
+    for e in ESSENCE do
+      if SameText(item, e) then
+        skip := True;
+    for k in Self.StartItems do
+      if SameText(item, k) then
+        skip := True;
+    if not skip then
+      Self.StartItems += item;
+  end;
+  if Self.StartItems <> [] then
+    Logger.Info('Keeping what you started with (never banked): ' + ToStr(Self.StartItems) + '.');
+end;
+
+// The tiara in the inventory: put it on ("Wear"). True when it's worn afterwards.
+function TCrafter.WearTiara(): Boolean;
+begin
+  if Inventory.Items.Count(Self.Site.Tiara) = 0 then
+    Exit;
+  Logger.Info('Key: putting on the ' + Self.Site.Tiara + '.');
+  try
+    Inventory.Items.Interact(Self.Site.Tiara, 'Wear');
+  except
+    Logger.Warn('Key: ' + GetExceptionMessage());
+  end;
+  Result := SleepUntil(Inventory.Items.Count(Self.Site.Tiara) = 0, 100, 3000);
+  if Result then
+    Self.TiaraWorn := True
+  else
+    Logger.Warn('Key: could not put on the ' + Self.Site.Tiara + '.');
+end;
+
+procedure TCrafter.CheckKey();
+begin
+  Self.TiaraWorn := False;
+  try
+    if Equipment.Open() then
+      Self.TiaraWorn := Equipment.Items.Count(Self.Site.Tiara) > 0;
+  except
+  end;
+  Inventory.Open();
+  // carried but not worn: put it on
+  if (not Self.TiaraWorn) and (Inventory.Items.Count(Self.Site.Tiara) > 0) then
+    Self.WearTiara();
+  if Self.TiaraWorn then
+    Logger.Info('Key: ' + Self.Site.Tiara + ' worn - it just enters the ruins.')
+  else if Self.HasTalisman() then
+    Logger.Info('Key: ' + Self.Site.Talisman + ' in the inventory - it uses it on the ruins.')
+  else
+    Logger.Info('Key: no ' + Self.Site.Tiara + ' worn and no ' + Self.Site.Talisman + ' - it gets one out of the bank (the tiara first).');
+end;
+
+procedure TCrafter.Init();
+var
+  roomX, roomY: Integer;
+begin
+  Logger.Setup('DMB''s F2P Runecrafter');
+  ProgressReport.Setup(
+    'DMB''s F2P Runecrafter',
+    ['Script runtime:', 'Altar:', 'Runes:', 'Runes/H:', 'Trips:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+  StartListeners(300);
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  Self.RCLevel := Stats.GetLevel(ESkill.RUNECRAFTING, False);
+  Inventory.Open();
+  Logger.Info('Runecrafting level: ' + ToStr(Self.RCLevel) + '.');
+  // you asked for it: everything in the inventory goes in the bank before the first trip
+  // (only this altar's talisman / tiara stay out)
+  Self.StartItems := [];
+  Self.FirstBank := True;
+
+  if (Self.RCLevel > 0) and (Self.RCLevel < Self.Site.Level) then
+  begin
+    if not Self.IgnoreChecks then
+      raise 'The ' + Self.Site.Name + ' altar needs ' + ToStr(Self.Site.Level) + ' Runecrafting (you have ' + ToStr(Self.RCLevel) + ').';
+    Logger.Warn('DEBUG: the ' + Self.Site.Name + ' altar needs ' + ToStr(Self.Site.Level) + ' Runecrafting - carrying on.');
+  end;
+
+  Logger.Info('Map: loading the areas and the altar rooms (this can take a moment the first time).');
+  // Our altar's room only (not all six: WaspLib mistook other places for them), plus:
+  //  - not Water: the F2P surface with the row north of Edgeville (the Mind ruins at game y
+  //    3514 are right on the edge without it) and the Ruins of Camdozaal (Mind's bank)
+  //  - Water: the F2P surface and Lumbridge Castle's top floor (its bank)
+  roomX := Self.Site.Altar.X div 64;
+  roomY := Self.Site.Altar.Y div 64;
+  if not Self.Site.Lumbridge then
+    Map.Setup([Chunk(Box(45, 55, 53, 48), 0), Chunk(Box(roomX - 1, roomY + 1, roomX + 1, roomY - 1), 0), Chunk(Box(44, 92, 48, 88), 0)])
+  else
+    Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(49, 51, 51, 49), 2), Chunk(Box(roomX - 1, roomY + 1, roomX + 1, roomY - 1), 0)]);
+  ALTAR_SPOT := Tile(Self.Site.Altar.X, Self.Site.Altar.Y);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  Map.Walker.ScreenWalk := False;
+
+  Logger.Info('Altar: ' + Self.Site.Name + ' (level ' + ToStr(Self.Site.Level) + '), bank: ' + Self.Site.BankName + '.');
+  Self.CheckKey();
+
+  if not Self.Site.Lumbridge then
+  begin
+    Self.HasBankObj := NearestObject(['Bank booth', 'Bank Booth', 'Bank chest'],
+                                     Tile(Self.Site.Bank.X, Self.Site.Bank.Y), 12, Self.BankObj);
+    if not Self.HasBankObj then
+      Logger.Warn('Bank: no booth near ' + Self.Site.BankName + ' - will use WaspLib''s nearest bank.');
+  end;
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.RUNECRAFTING, ESkill.TOTAL];
+  SlowAntiban();
+  Logger.Info('Start: we are at ' + Here() + '.');
+end;
+
+// ---------------------------------------------------------------- bank
+
+procedure TCrafter.OpenBank();
+var
+  dest: TPoint;
+  opened: Boolean;
+begin
+  UnselectItem();
+  CloseStrayInterface(True);
+  if Self.Site.Lumbridge then
+    opened := OpenLumbridgeBank()
+  else if Self.Site.Camdozaal then
+  begin
+    if not EnterCamdozaal() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not get into the Ruins of Camdozaal. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+    WalkToCamdoChest();
+    Logger.Info('Bank: opening the Camdozaal bank chest.');
+    GuardWalk(45000);
+    try
+      if Self.HasBankObj then
+        opened := Bank.Open(Self.BankObj, True)
+      else
+        opened := Bank.Open(True);
+    except
+      Logger.Warn('Bank: opening failed: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end
+  else
+  begin
+    if CurrentFloor() > 0 then
+      LeaveTopFloor();
+    dest := Tile(Self.Site.Bank.X, Self.Site.Bank.Y);
+    if Map.Position().DistanceTo(dest) > 6 * RSTranslator.TILE_SIZE then
+    begin
+      Logger.Info('Bank: walking to ' + Self.Site.BankName + ' (' +
+                  ToStr(Round(Map.Position().DistanceTo(dest) / RSTranslator.TILE_SIZE)) + ' tiles).');
+      SafeWebWalk(dest, 300000, 4);
+    end;
+    Logger.Info('Bank: opening the bank.');
+    GuardWalk(45000);
+    try
+      if Self.HasBankObj then
+        opened := Bank.Open(Self.BankObj, True)
+      else
+        opened := Bank.Open(True);
+    except
+      Logger.Warn('Bank: opening failed: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end;
+
+  if opened or Bank.IsOpen() then
+    Exit;
+  Inc(Self.Failures);
+  Logger.Warn('Bank: could not open the bank (we are at ' + Here() + ').');
+  Sleep(1500, 2500);
+  if Self.Failures >= 4 then
+    Self.StopReason := 'Could not open the ' + Self.Site.BankName + ' bank. Please post this log in a GitHub issue.';
+end;
+
+// WaspLib's own Bank.Withdraw first; only if that gets nothing, search the bank by name.
+function WithdrawItem(item: String; amount: Integer): Boolean;
+var
+  option: String;
+begin
+  try
+    Bank.Withdraw(new TBankItem(item, amount));
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  if SleepUntil(Inventory.Items.Count(item) > 0, 100, 3000) then
+    Exit(True);
+  if amount = 1 then
+    option := 'Withdraw-1'
+  else
+    option := 'Withdraw-All';
+  SearchAndWithdraw(item, option);
+  Result := Inventory.Items.Count(item) > 0;
+end;
+
+procedure TCrafter.DoBank();
+var
+  e: String;
+begin
+  Self.DebugTrip := False;
+  if Inventory.Items.ContainsDifferent(Self.KeepItems()) then
+  begin
+    if Self.FirstBank then
+      Logger.Info('Bank: banking everything in the inventory before starting.')
+    else
+      Logger.Info('Bank: depositing the runes.');
+    if Bank.DepositDifferent(Self.KeepItems()) then
+      SleepUntil(not Inventory.Items.ContainsDifferent(Self.KeepItems()), 100, 3000);
+  end;
+
+  Self.FirstBank := False;
+
+  // the key: tiara worn, or a talisman (never banked). The tiara first: take it out and wear it.
+  if (not Self.TiaraWorn) and not Self.HasTalisman() then
+  begin
+    if WithdrawItem(Self.Site.Tiara, 1) then
+    begin
+      Logger.Info('Bank: took out the ' + Self.Site.Tiara + ' - putting it on.');
+      Bank.Close();
+      SleepUntil(not Bank.IsOpen(), 100, 3000);
+      Self.WearTiara();
+      Exit;          // the bank opens again for the essence
+    end;
+    Logger.Info('Bank: taking out a ' + Self.Site.Talisman + '.');
+    if not WithdrawItem(Self.Site.Talisman, 1) then
+    begin
+      if not Self.IgnoreChecks then
+      begin
+        Self.StopReason := 'No ' + Self.Site.Tiara + ' worn and no ' + Self.Site.Talisman + ' in the inventory or the bank.';
+        Bank.Close();
+        Exit;
+      end;
+      Logger.Warn('DEBUG: no ' + Self.Site.Talisman + ' in the bank either - carrying on.');
+    end;
+  end;
+
+  // the essence (rune essence first, then pure essence)
+  for e in ESSENCE do
+  begin
+    Logger.Info('Bank: taking out ' + e + '.');
+    if WithdrawItem(e, QUANTITY_ALL) then
+      Break;
+  end;
+
+  if EssenceCount() = 0 then
+  begin
+    if Self.IgnoreChecks then
+    begin
+      Logger.Warn('DEBUG: no essence in the bank - walking to the ruins anyway.');
+      Self.DebugTrip := True;
+    end
+    else
+    begin
+      Self.StopReason := 'The bank is out of rune essence.';
+      Bank.Close();
+      Exit;
+    end;
+  end;
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  if not Self.DebugTrip then
+    Logger.Info('Bank: ' + ToStr(EssenceCount()) + ' essence. Trip ' + ToStr(Self.Trips) + '. Off to the ' + Self.Site.Name + ' altar.');
+  Bank.Close();
+  SleepUntil(not Bank.IsOpen(), 100, 3000);
+end;
+
+// ---------------------------------------------------------------- ruins, altar, portal
+
+procedure TCrafter.ToRuins();
+begin
+  if InCamdozaal() then
+    if not LeaveCamdozaal() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not get out of the Ruins of Camdozaal. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+  if CurrentFloor() > 0 then
+    if not LeaveTopFloor() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not get down the Lumbridge Castle stairs. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+
+  Logger.Info('Travel: to the ' + Self.Site.Name + ' altar ruins (' +
+              ToStr(Round(Map.Position().DistanceTo(Self.RuinsTile()) / RSTranslator.TILE_SIZE)) + ' tiles).');
+  if SafeWebWalk(Self.RuinsTile(), 300000, 6) then
+  begin
+    Self.Failures := 0;
+    Logger.Info('Travel: at the ruins.');
+    if Self.DebugTrip then
+    begin
+      Logger.Warn('DEBUG: at the ruins with no essence - back to the bank.');
+      Self.DebugTrip := False;
+    end;
+    Exit;
+  end;
+  Inc(Self.Failures);
+  if Self.Failures >= 3 then
+    Self.StopReason := 'Could not walk to the ' + Self.Site.Name + ' altar ruins (we are at ' + Here() + '). Please post this log in a GitHub issue.';
+end;
+
+// Into the altar: "Enter" with the tiara worn, or use the talisman on the ruins.
+procedure TCrafter.EnterRuins();
+var
+  ruins: TObject;
+  done: Boolean;
+  c, pt, p: TPoint;
+  k: Integer;
+begin
+  UnselectItem();
+  CloseStrayInterface(True);
+  if not NearestObject(['Mysterious ruins', 'Mysterious Ruins'], Self.RuinsTile(), 15, ruins) then
+  begin
+    Logger.Warn('Ruins: WaspLib knows no ruins near game (' + ToStr(Self.Site.Ruins.X) + ', ' + ToStr(Self.Site.Ruins.Y) + ').');
+    Inc(Self.AltarFails);
+    Exit;
+  end;
+
+  // tiara worn: WaspLib's own "Enter" on the ruins first
+  if Self.TiaraWorn then
+  begin
+    Logger.Info('Ruins: entering (' + Self.Site.Tiara + ').');
+    GuardWalk(30000);
+    try
+      done := ruins.WalkInteract(['Enter']);
+    except
+      Logger.Warn('Ruins: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+    if done and SleepUntil(InAltarRoom(), 200, 10000) then
+    begin
+      Logger.Info('Ruins: inside the ' + Self.Site.Name + ' altar.');
+      Self.AltarFails := 0;
+      Sleep(600, 1100);
+      Exit;
+    end;
+    Logger.Info('Ruins: WaspLib''s Enter did not get us in - clicking the ruins by their position.');
+    done := False;
+  end;
+
+  GuardWalk(30000);
+  try
+    begin
+      // tiara worn (fallback): no talisman to click - the ruins' left-click is "Enter". Talisman: click
+      // the talisman, then click the ruins. WaspLib's hover on the ruins doesn't work
+      // here, so: the ruins' position from WaspLib's data -> where that is on the screen ->
+      // hover around it until the hover text says "... -> Mysterious ruins" -> click.
+      if Self.TiaraWorn then
+        Logger.Info('Ruins: entering (' + Self.Site.Tiara + ').')
+      else
+        Logger.Info('Ruins: using the ' + Self.Site.Talisman + ' on them.');
+      c := ruins.Coordinates[0];
+      if not TileOnScreen(c, pt) then
+      begin
+        SafeWebWalk(c, 30000, 3);
+        Map.Walker.WaitMoving();
+      end;
+      if (not Self.TiaraWorn) and not Inventory.Select(Self.Site.Talisman, True) then
+        Logger.Warn('Ruins: could not select the ' + Self.Site.Talisman + '.')
+      else
+      begin
+        Sleep(200, 400);
+        for k := 0 to 17 do
+        begin
+          if (k = 9) then
+          begin
+            // not found from this angle: turn the camera and look again
+            Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+            Sleep(700, 1100);
+          end;
+          if not TileOnScreen(c, pt) then
+            Continue;
+          case k mod 9 of
+            0: p := pt;
+            1: p := Point(pt.X, pt.Y - 12);
+            2: p := Point(pt.X - 14, pt.Y - 6);
+            3: p := Point(pt.X + 14, pt.Y - 6);
+            4: p := Point(pt.X, pt.Y + 10);
+            5: p := Point(pt.X - 24, pt.Y);
+            6: p := Point(pt.X + 24, pt.Y);
+            7: p := Point(pt.X, pt.Y - 24);
+            8: p := Point(pt.X, pt.Y + 20);
+          end;
+          p := Point(p.X + Random(-2, 2), p.Y + Random(-2, 2));
+          if not MainScreen.Bounds.Contains(p) then
+            Continue;
+          Mouse.Move(p);
+          if MainScreen.IsUpText(['uins', 'Ruins', 'Enter'], True, 0.8, 70) then
+          begin
+            Mouse.Click(EMouseButton.LEFT);
+            done := True;
+            Break;
+          end;
+        end;
+        if not done then
+        begin
+          Logger.Warn('Ruins: could not find them on the screen (hover text "' + MainScreen.UpText + '").');
+          if not Self.TiaraWorn then
+            UnselectItem();
+        end;
+      end;
+    end;
+  except
+    Logger.Warn('Ruins: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+
+  if done and SleepUntil(InAltarRoom(), 200, 10000) then
+  begin
+    Logger.Info('Ruins: inside the ' + Self.Site.Name + ' altar.');
+    Self.AltarFails := 0;
+    Sleep(600, 1100);
+    Exit;
+  end;
+  Logger.Warn('Ruins: did not get in.');
+  Inc(Self.AltarFails);
+end;
+
+// "Craft-rune" on the altar; all the essence turns into runes at once.
+procedure TCrafter.CraftRunes();
+var
+  altar: TObject;
+  before, runesBefore: Integer;
+begin
+  UnselectItem();
+  CloseStrayInterface(True);
+  if not NearestObject(['Altar'], Self.AltarTile(), 25, altar) then
+  begin
+    Logger.Warn('Altar: WaspLib knows no altar in here (we are at ' + Here() + ').');
+    Inc(Self.AltarFails);
+    Exit;
+  end;
+  before := EssenceCount();
+  runesBefore := Inventory.Items.CountEx(Self.Site.Rune);
+  GuardWalk(30000);
+  try
+    altar.WalkInteract(['Craft']);
+  except
+    Logger.Warn('Altar: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+
+  if SleepUntil(EssenceCount() < before, 200, 10000) then
+  begin
+    SleepUntil(EssenceCount() = 0, 200, 3000);
+    Sleep(400, 800);
+    Self.Runes += Max(0, Inventory.Items.CountEx(Self.Site.Rune) - runesBefore);
+    Logger.Info('Altar: crafted ' + ToStr(Inventory.Items.CountEx(Self.Site.Rune) - runesBefore) + ' ' + Self.Site.Rune + 's (' +
+                ToStr(Self.Runes) + ' so far).');
+    Self.AltarFails := 0;
+    Activity.Restart();
+  end
+  else
+  begin
+    Logger.Warn('Altar: no runes made.');
+    Inc(Self.AltarFails);
+  end;
+end;
+
+// Out through the portal (it puts us next to the ruins).
+procedure TCrafter.LeaveAltar();
+var
+  portal: TObject;
+begin
+  UnselectItem();
+  CloseStrayInterface(True);
+  if not NearestObject(['Portal'], Self.AltarTile(), 25, portal) then
+  begin
+    Logger.Warn('Portal: WaspLib knows no portal in here (we are at ' + Here() + ').');
+    Inc(Self.AltarFails);
+    Exit;
+  end;
+  GuardWalk(30000);
+  try
+    portal.WalkInteract(['Use']);
+  except
+    Logger.Warn('Portal: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  if SleepUntil(not InAltarRoom(), 200, 10000) then
+  begin
+    Logger.Info('Portal: out, by the ruins.');
+    Self.AltarFails := 0;
+    Sleep(600, 1100);
+  end
+  else
+  begin
+    Logger.Warn('Portal: still inside.');
+    Inc(Self.AltarFails);
+  end;
+end;
+
+// ---------------------------------------------------------------- main loop
+
+function ReallyInWilderness(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InWilderness(Map.Position()) then
+      Exit(False);
+    if i < 3 then
+      Sleep(700, 900);
+  end;
+  Result := True;
+end;
+
+function TCrafter.GetState(): ERCState;
+begin
+  if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+  begin
+    if Self.StopReason = '' then
+      Self.StopReason := 'Stopped at the Wilderness. Move the character out and restart.';
+    Exit(ERCState.STOP);
+  end;
+  if Self.StopReason <> '' then
+    Exit(ERCState.STOP);
+  if Self.AltarFails >= 6 then
+  begin
+    Self.StopReason := 'Could not get into / use the ' + Self.Site.Name + ' altar 6 times in a row. Please post this log in a GitHub issue.';
+    Exit(ERCState.STOP);
+  end;
+  if Activity.IsFinished then
+    Exit(ERCState.NO_ACTIVITY);
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+    Exit(ERCState.MAX_TIME);
+  if not Client.IsLoggedIn() then
+    Exit(ERCState.LOGIN);
+  if Chat.LeveledUp() then
+    Exit(ERCState.LEVEL_UP);
+
+  if InAltarRoom() then
+  begin
+    if EssenceCount() > 0 then
+      Exit(ERCState.CRAFT);
+    Exit(ERCState.LEAVE);
+  end;
+
+  if Bank.IsOpen() then
+    Exit(ERCState.BANK);
+
+  // first thing: bank whatever is in the inventory
+  if Self.FirstBank and (not Self.IgnoreChecks) then
+    Exit(ERCState.OPEN_BANK);
+
+  // essence but no way in (no tiara worn, no talisman): get the key from the bank first
+  if (not Self.TiaraWorn) and (not Self.HasTalisman()) and (not Self.IgnoreChecks) then
+  begin
+    if Inventory.Items.Count(Self.Site.Tiara) > 0 then
+      Self.WearTiara();
+    if (not Self.TiaraWorn) and not Self.HasTalisman() then
+      Exit(ERCState.OPEN_BANK);
+  end;
+
+  if (EssenceCount() > 0) or Self.DebugTrip then
+  begin
+    if (CurrentFloor() = 0) and (Map.Position().DistanceTo(Self.RuinsTile()) <= 8 * RSTranslator.TILE_SIZE) then
+    begin
+      if Self.DebugTrip then
+        Exit(ERCState.TO_RUINS);   // (it turns round there)
+      Exit(ERCState.ENTER);
+    end;
+    Exit(ERCState.TO_RUINS);
+  end;
+  Result := ERCState.OPEN_BANK;
+end;
+
+procedure TCrafter.Run();
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      ERCState.LOGIN: DoLoginSafe();
+      ERCState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+          Self.RCLevel := Max(Self.RCLevel, Stats.GetLevel(ESkill.RUNECRAFTING, False));
+          Logger.Info('Level up! Runecrafting ' + ToStr(Self.RCLevel) + '.');
+          Inventory.Open();
+        end;
+      ERCState.OPEN_BANK: Self.OpenBank();
+      ERCState.BANK: Self.DoBank();
+      ERCState.TO_RUINS: Self.ToRuins();
+      ERCState.ENTER: Self.EnterRuins();
+      ERCState.CRAFT: Self.CraftRunes();
+      ERCState.LEAVE: Self.LeaveAltar();
+      ERCState.NO_ACTIVITY, ERCState.MAX_TIME, ERCState.STOP: Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  if Self.StopReason <> '' then
+    Logger.Error('Stopped: ' + Self.StopReason)
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+// ---------------------------------------------------------------- settings window
+
+var
+  Crafter: TCrafter;
+  CraftForm: TScriptForm;
+  GuiRCLevel: Integer;
+  RuntimeEdit: TLazEdit;
+  AltarSelector: TLazComboBox;
+  DebugBox: TLazCheckBox;
+  StartLocked: String;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Crafter.MaxTime := minutes * MINUTE;
+  Crafter.Site := ALTARS[Max(0, AltarSelector.ItemIndex)];
+  Crafter.IgnoreChecks := DebugBox.Checked;
+  StartLocked := '';
+  if (not Crafter.IgnoreChecks) and (GuiRCLevel > 0) and (GuiRCLevel < Crafter.Site.Level) then
+    StartLocked := 'needs ' + ToStr(Crafter.Site.Level) + ' Runecrafting (you have ' + ToStr(GuiRCLevel) + ')';
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i, best: Integer;
+  line: String;
+begin
+  if GuiRCLevel > 0 then
+    Self.Setup('DMB''s F2P Runecrafter - Runecrafting ' + ToStr(GuiRCLevel))
+  else
+    Self.Setup('DMB''s F2P Runecrafter');
+  tab := Self.CreateTab('Runecrafter');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run, in minutes.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  AltarSelector := TLazComboBox.CreateEx(tab, 'Altar:', 'Which runes to make. The essence must be in your bank.', 40, 110, 420);
+  best := 0;
+  for i := 0 to High(ALTARS) do
+  begin
+    line := ALTARS[i].Name + ' runes (Runecrafting ' + ToStr(ALTARS[i].Level) + ', bank: ' + ALTARS[i].BankName + ')';
+    if (GuiRCLevel > 0) and (GuiRCLevel < ALTARS[i].Level) then
+      line += ' - LOCKED'
+    else
+      best := i;
+    AltarSelector.Items.Add(line);
+  end;
+  AltarSelector.ItemIndex := best;
+
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the level and item checks',
+    'For testing the walking only. A LOCKED altar starts anyway, and no essence / talisman / tiara only gives a warning: it still walks to the ruins and back to the bank, round and round.', 40, 180);
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  SetupAltars();
+
+  Logger.Info('Reading your Runecrafting level before opening the settings...');
+  try
+    if not Client.IsLoggedIn() then
+      DoLoginSafe();
+    GuiRCLevel := Stats.GetLevel(ESkill.RUNECRAFTING, False);
+    Inventory.Open();
+  except
+    Logger.Warn('Could not read the Runecrafting level: ' + GetExceptionMessage());
+  end;
+
+  CraftForm.Init();
+  SetClientInputLocked(True);
+  try
+    if StartLocked <> '' then
+      Logger.Error('The ' + Crafter.Site.Name + ' altar is locked: ' + StartLocked +
+                   '. Pick another altar (or tick the debug box to run it anyway).')
+    else
+      Crafter.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

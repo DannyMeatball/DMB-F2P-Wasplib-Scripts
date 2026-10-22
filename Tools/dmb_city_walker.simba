@@ -1,0 +1,718 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =============================================================================================
+// DMB's City Walker                                     Simba 2.0 + WaspLib (Includes\WaspLib)
+// =============================================================================================
+//
+// Pick a city in the window, press Start: the bot walks there from wherever you are in the
+// F2P area (Falador to Al Kharid, Draynor to Edgeville), then stops.
+//
+// Walking: WaspLib's walker, with the same safety as DMB's F2P Miner:
+//   - long route steps are filled in every 10 tiles (the minimap only reaches ~15)
+//   - not moved for 8 s = that walk is stopped and tried again (up to 3 times)
+//   - never into the Wilderness: a walk heading there is stopped
+//   - optional: Home Teleport to Lumbridge if WaspLib can't get there, then walk again
+//
+// Al Kharid: WaspLib's walker can't open the toll gate, so the script does it itself when the
+// walk crosses the Lumbridge / Al Kharid fence (either way): it tries the gate - "Open" (free
+// with Prince Ali Rescue), the guard / "Pay-toll" with 10+ coins - turning the camera if it
+// can't see the gate. Not let through: the long way round the fence.
+// =============================================================================================
+
+var
+  CITY_NAMES: TStringArray = [
+    'Lumbridge (castle courtyard)',
+    'Varrock (square)',
+    'Grand Exchange',
+    'Edgeville',
+    'Barbarian Village',
+    'Falador (square)',
+    'Draynor Village',
+    'Port Sarim',
+    'Rimmington',
+    'Al Kharid'
+  ];
+  // game tiles (x, y), same order as the names
+  CITY_TILES: TPointArray = [
+    [3222, 3218], [3212, 3428], [3164, 3480], [3093, 3485], [3082, 3420],
+    [2965, 3380], [3093, 3248], [3012, 3220], [2957, 3214], [3285, 3180]
+  ];
+
+  Destination: Integer;
+  UseTeleport: Boolean;
+
+  WalkDeadline, WalkLogAt, WalkStallSince: UInt64;
+  WalkStallSpot: TPoint;
+  WildernessHit: Boolean;
+  NoRoute: Boolean;             // WaspLib couldn't plan any route from where it thinks we are
+
+  // Lumbridge <-> Al Kharid toll gate (from the miner)
+  TOLL_GATE: TPoint = [13068, 37522];
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+  // the long way round the fence, game tiles
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+const
+  TOLL_COINS = 10;
+
+// Game tile -> WaspLib map pixels (the numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '(' + ToStr(me.X div 4) + ', ' + ToStr((50430 - me.Y) div 4) + ')';
+end;
+
+// North of the Wilderness ditch (game y 3523 and up)?
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+// Called by WaspLib's walker while it walks: progress log, time limit, stuck check, Wilderness.
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // (a destination hundreds of tiles away is a bad point from WaspLib's walker - ignore those)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it.');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at ' + Here() + ', next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if WalkDeadline = 0 then
+    Exit;
+
+  if GetTimeRunning() > WalkDeadline then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+  begin
+    WalkStallSpot := position;
+    WalkStallSince := GetTimeRunning();
+  end
+  else if GetTimeRunning() - WalkStallSince > 8000 then
+  begin
+    Logger.Warn('Walk: not moved for 8 s (stuck on something), stopping this walk.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+  end;
+end;
+
+// WaspLib's walker with a time limit and the route filled in every 10 tiles.
+// True when we end within `reachTiles` of `dest`.
+function SafeWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  if InWilderness(dest) then
+  begin
+    WildernessHit := True;
+    Exit(False);
+  end;
+  CloseStrayInterface(True);   // a window left open (misclick) blocks the walk
+
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+    if Pos('no nodes', Lowercase(GetExceptionMessage())) > 0 then
+      NoRoute := True;
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// East of the Lumbridge / Al Kharid fence?
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+  if (bj = -1) or (best > maxTiles * RSTranslator.TILE_SIZE) then
+    Exit(False);
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Result := True;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+// Coins in the inventory: the size of the stack.
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= TOLL_COINS then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it, no settings needed:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free). Remembered.
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through / the gate hasn't got these options: we can't get through here
+//      (the caller then walks the long way round the fence).
+function CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not SafeWalk(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := CoinCount();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= TOLL_COINS then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if True then
+    if GateMenu(gate, ['oll', 'Pay'], menu) then
+      if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+      begin
+        Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+        Exit(True);
+      end;
+
+  // 4) no way through here
+  if coins < TOLL_COINS then
+    Logger.Warn('Gate: not let through and fewer than ' + ToStr(TOLL_COINS) + ' coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence (when the toll gate doesn't let us through).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not SafeWalk(path[0], 240000, 4) then
+      Exit;
+  end;
+
+  Logger.Info('Long way: walking round the fence.');
+  for i := start to High(path) do
+    if not SafeWalk(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+      Exit;
+    end;
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+end;
+
+// Home Teleport to Lumbridge (free; 30 min cooldown, stops if attacked).
+function HomeTeleport(): Boolean;
+var
+  before: TPoint;
+begin
+  Logger.Info('Teleport: casting Home Teleport to Lumbridge.');
+  before := Map.Position();
+  try
+    if not Magic.Cast(ESpell.LUMBRIDGE_HOME_TELEPORT) then
+    begin
+      Logger.Warn('Teleport: could not cast it.');
+      Exit;
+    end;
+  except
+    Logger.Warn('Teleport: ' + GetExceptionMessage());
+    Exit;
+  end;
+  Result := SleepUntil(Map.Position().DistanceTo(before) > 30 * RSTranslator.TILE_SIZE, 500, 25000);
+  Inventory.Open();
+  if Result then
+    Logger.Info('Teleport: now at ' + Here() + '.')
+  else
+    Logger.Warn('Teleport: it did not happen (still on its 30 min cooldown, or attacked?).');
+end;
+
+// Walk to the chosen city: a few tries, then (optionally) Home Teleport and try again.
+function WalkToCity(): Boolean;
+var
+  dest: TPoint;
+  attempt: Integer;
+begin
+  dest := Tile(CITY_TILES[Destination].X, CITY_TILES[Destination].Y);
+  Logger.Info('Walk: to ' + CITY_NAMES[Destination] + ', ' +
+              ToStr(Round(Map.Position().DistanceTo(dest) / RSTranslator.TILE_SIZE)) + ' tiles from ' + Here() + '.');
+
+  for attempt := 1 to 3 do
+  begin
+    NoRoute := False;
+
+    // the Lumbridge / Al Kharid fence is in the way: the toll gate, or the long way round
+    if InAlKharid(Map.Position()) <> InAlKharid(dest) then
+      if not CrossTollGate() then
+      begin
+        Logger.Info('Walk: the toll gate is no good - taking the long way round the fence.');
+        WalkLongWay(InAlKharid(dest));
+      end;
+
+    if SafeWalk(dest, 300000, 6) then
+      Exit(True);
+    if WildernessHit then
+      Exit(False);
+    // no route at all: retrying the same walk won't help - we're probably somewhere the map
+    // doesn't cover (Karamja, upstairs, underground...)
+    if NoRoute then
+    begin
+      Logger.Warn('Walk: WaspLib has no route from ' + Here() + '. You are probably outside the area ' +
+                  'this script knows (Falador to Al Kharid, Draynor to Edgeville, ground floor).');
+      Break;
+    end;
+    Logger.Info('Walk: not there yet (try ' + ToStr(attempt) + ' of 3), we are at ' + Here() + '.');
+    Sleep(800, 1500);
+  end;
+
+  if not UseTeleport then
+    Logger.Warn('Walk: Home Teleport is not ticked, so no teleport to try.');
+  if UseTeleport and HomeTeleport() then
+    for attempt := 1 to 2 do
+      if SafeWalk(dest, 300000, 6) then
+        Exit(True);
+end;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// ---------------------------------------------------------------- GUI
+
+var
+  WalkerForm: TScriptForm;
+  CitySelector: TLazComboBox;
+  TeleportBox: TLazCheckBox;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+begin
+  Destination := Max(0, CitySelector.ItemIndex);
+  UseTeleport := TeleportBox.Checked;
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i: Integer;
+begin
+  Self.Setup('DMB''s City Walker');
+  tab := Self.CreateTab('Walker');
+
+  CitySelector := TLazComboBox.CreateEx(tab, 'Walk to:', 'The city to walk to. Starts from wherever you are in the F2P area.', 40, 40, 320);
+  for i := 0 to High(CITY_NAMES) do
+    CitySelector.Items.Add(CITY_NAMES[i]);
+  CitySelector.ItemIndex := 0;
+
+  TeleportBox := TLazCheckBox.CreateEx(tab, 'Home Teleport to Lumbridge if the walk fails',
+                                       'If WaspLib can''t get there from here, teleport to Lumbridge and walk from there (30 min cooldown).', 40, 110);
+  TeleportBox.Checked := True;
+
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  Logger.Setup('DMB''s City Walker');
+  WalkerForm.Init();
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+
+  Logger.Info('Map: loading the F2P area (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(45, 54, 53, 48), 0)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+
+  SetClientInputLocked(True);
+  try
+    if InWilderness(Map.Position()) then
+      Logger.Error('You are in the Wilderness - walk out first, then start again.')
+    else if WalkToCity() then
+      Logger.Info('Arrived at ' + CITY_NAMES[Destination] + ' ' + Here() + '.')
+    else if WildernessHit then
+      Logger.Error('The way there goes into the Wilderness - stopped.')
+    else
+      Logger.Error('Could not get to ' + CITY_NAMES[Destination] + ' from ' + Here() + '. Please post this log in a GitHub issue.');
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

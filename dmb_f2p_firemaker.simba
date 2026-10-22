@@ -1,0 +1,1844 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =====================================================================================
+//  DMB's F2P Firemaker                                       Simba 2.0 + WaspLib
+// =====================================================================================
+// FILES (all in Scripts\)
+//   dmb_f2p_firemaker.simba   this script
+//   Logs go to Data\Logs\DMB's F2P Firemaker\
+//
+// HOW TO USE
+//   Start it logged in (or at the login screen). It reads your Firemaking level, then opens the
+//   settings window. Pick the logs and the bank ("Nearest bank" = the closest one to where you
+//   stand when you press Start), press Start. Then, round and round:
+//     bank -> take out the logs (and a tinderbox if you have none) -> walk OUT of the bank to
+//     its burn spot (you can't light fires inside a bank) -> light ONE fire -> use the logs on
+//     it (the game puts them all on, one after another) -> back to the bank.
+//   While it runs, RuneLite ignores your own mouse and keyboard.
+//
+// FIRES
+//   - The log leaves the inventory as soon as it's put on the ground: that's NOT the fire. It
+//     counts a fire as lit when the game says "The fire catches..." or you step aside, then
+//     hovers the fire's tile to check the hover text says Fire.
+//   - "You can't light a fire here." -> it steps a few tiles and tries again.
+//   - Feeding a fire turns it into a Forester's Campfire. Next trip, "There's a Forester's
+//     Campfire nearby..." -> if it's ours (where we lit it) the logs go on that; otherwise it
+//     moves ~10 tiles away and lights a new one.
+//
+// BANKS (nearest = closest in a straight line; Al Kharid through the toll gate)
+//   Varrock West, Varrock East, Grand Exchange, Edgeville, Draynor, Falador West, Falador East,
+//   Al Kharid, Lumbridge Castle (top floor - the fires are lit on the top floor too)
+//   Each bank has a burn spot just outside it, checked in the game (you can't light fires
+//   inside a bank). Lumbridge's is on the top floor next to the bank.
+//
+// LOGS                    FIREMAKING
+//   Logs                  1
+//   Oak logs              15
+//   Willow logs           30
+//   Yew logs              60
+//   "Best I can burn"     the best logs your level can burn that the bank still has - when
+//                         they run out it moves down to the next kind.
+//   Logs you lack the Firemaking level for say LOCKED in the settings and won't start.
+//   Logs and the tinderbox come out with WaspLib's Bank.Withdraw (if that gets nothing: a bank
+//   search by name, checked by hover text); the logs are then checked by their hover text.
+//
+// ITEMS: whatever is in your inventory when you press Start (except logs) is yours: never
+//   banked. A tinderbox is taken out of the bank if you have none (never banked).
+//
+// DEBUG (tick "Debug: turn off the level and item checks") - for testing the walking:
+//   LOCKED logs start anyway; no logs / no tinderbox only give a warning: it still walks to
+//   the burn spot and back to the bank, round and round.
+//
+// SAFETY: never into the Wilderness; every walk has a time limit and an 8 s stuck check;
+//   banks and stairs are WaspLib's own objects - no searching the screen.
+// =====================================================================================
+
+type
+  TBankSpot = record
+    Name: String;
+    Bank, Burn: TPoint;             // game tiles: the bank, the burn spot outside it
+    BurnFloor: Integer;             // the floor the burn spot is on (Lumbridge: the top floor, 2)
+    Lumbridge, AlKharid: Boolean;
+  end;
+
+  EBurnState = enum(LOGIN, LEVEL_UP, LEAVE_TOP, OPEN_BANK, BANK, TO_SPOT, BURN, NO_ACTIVITY, MAX_TIME, STOP);
+
+const
+  ANTIBAN_SLOWDOWN = 3;
+  TOLL_COINS = 10;
+
+var
+  BANKS: array of TBankSpot;
+
+  LOG_NAMES: TStringArray = ['Logs', 'Oak logs', 'Willow logs', 'Yew logs'];
+  LOG_LEVELS: TIntegerArray = [1, 15, 30, 60];
+
+  // Lumbridge Castle (tested in the miner and fisher): ground-floor staircase, top floor
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // game (3206, 3209)
+  TOP_STAIRS: TPoint = [64032, 37590];
+  TOP_BANK: TPoint = [64036, 37550];
+
+  // walker watchdog
+  WalkDeadline, WalkLogAt, WalkStallSince: UInt64;
+  WalkStallSpot: TPoint;
+  WildernessHit: Boolean;
+
+procedure AddBank(name: String; bx, by, fx, fy: Integer; lumbridge, alKharid: Boolean);
+var
+  b: TBankSpot;
+begin
+  b.Name := name;
+  b.Bank := Point(bx, by);
+  b.Burn := Point(fx, fy);
+  b.Lumbridge := lumbridge;
+  b.AlKharid := alKharid;
+  BANKS += b;
+end;
+
+// Bank tiles are the ones the miner/smelter/smither use. Burn spots: open ground a few tiles
+// outside each bank (approximate - "can't light a fire here" makes it step and try again).
+procedure SetupBanks();
+begin
+  // burn spots from your coordinate finder (tiles where you CAN light a fire)
+  AddBank('Varrock West',     3185, 3437,  3183, 3448, False, False);
+  AddBank('Varrock East',     3253, 3421,  3256, 3428, False, False);
+  // Grand Exchange: "anywhere over 1 tile away from the bankers" - 4 tiles south of the booths
+  AddBank('Grand Exchange',   3164, 3488,  3164, 3483, False, False);
+  AddBank('Edgeville',        3094, 3492,  3093, 3500, False, False);
+  AddBank('Draynor',          3092, 3243,  3092, 3247, False, False);
+  AddBank('Falador West',     2946, 3368,  2946, 3374, False, False);
+  AddBank('Falador East',     3013, 3356,  3012, 3359, False, False);
+  AddBank('Al Kharid',        3270, 3167,  3273, 3166, False, True);
+  // Lumbridge: on the TOP floor by the bank (your spot) - no stairs between bank and fire
+  AddBank('Lumbridge Castle', 3206, 3209,  3207, 3218, True,  False);
+  BANKS[High(BANKS)].BurnFloor := 2;
+end;
+
+// ---------------------------------------------------------------- helpers (from the miner/fisher)
+
+// Game tile -> WaspLib map pixels (the same numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// North of the Wilderness ditch (game y 3523 and up)? Map pixels.
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+// East of the Lumbridge / Al Kharid fence?
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// An item left selected in the inventory (e.g. after a misclick) makes every click on the
+// game "Use item ->", and the bank / objects can't be opened. Unselect it.
+procedure UnselectItem();
+var
+  sel: Integer;
+begin
+  try
+    sel := Inventory.GetSelected();
+  except
+    Exit;
+  end;
+  if sel < 0 then
+    Exit;
+  Logger.Info('An item in the inventory was selected (slot ' + ToStr(sel + 1) + ') - unselecting it.');
+  Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+  SleepUntil(Inventory.GetSelected() < 0, 100, 1500);
+  Mouse.Move(Point(MainScreen.Bounds.Center.X + Random(-80, 80), MainScreen.Bounds.Center.Y + Random(-60, 60)));
+end;
+
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // never into the Wilderness (a destination hundreds of tiles away is a bad point from
+  // WaspLib's walker, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  // stuck against something: not moved a tile in 8 s -> stop
+  if WalkDeadline > 0 then
+  begin
+    if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+    begin
+      WalkStallSpot := position;
+      WalkStallSince := GetTimeRunning();
+    end
+    else if GetTimeRunning() - WalkStallSince > 8000 then
+    begin
+      Logger.Warn('Walk: not moved for 8 s at [' + ToStr(position.X) + ', ' + ToStr(position.Y) +
+                  '] (stuck on something), stopping this walk.');
+      walker^.Walking := False;
+      WalkDeadline := 0;
+    end;
+  end;
+end;
+
+// Start the watchdog's time limit + stall check for a walk WaspLib does itself (bank, furnace).
+procedure GuardWalk(ms: Integer);
+begin
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+end;
+
+// WaspLib's walker with a time limit. True when we end within `reachTiles` of `dest`.
+function WebWalkRaw(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  if InWilderness(dest) then
+  begin
+    Logger.Error('Walk: refusing to walk into the Wilderness.');
+    WildernessHit := True;
+    Exit(False);
+  end;
+
+  GuardWalk(ms);
+  try
+    // fill in a point every 10 tiles: the minimap only reaches ~15 tiles
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// Minimap click `tiles` tiles away in a world direction (dx east, dy north = -1...).
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Logger.Warn('WaspLib objects: looking up "' + name + '" failed: ' + GetExceptionMessage());
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if bj = -1 then
+  begin
+    Logger.Warn('WaspLib objects: no "' + names[0] + '" in the loaded map at all.');
+    Exit(False);
+  end;
+  if best > maxTiles * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('WaspLib objects: nearest "' + single.Name + '" is ' + ToStr(Round(best / RSTranslator.TILE_SIZE)) +
+                ' tiles away (want ' + ToStr(maxTiles) + ').');
+    Exit(False);
+  end;
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Result := True;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+// Use the staircase WaspLib knows next to `spot`. `wanted` are bits of the menu line to pick,
+// best first (the menu reader garbles letters, so short bits: 'op-floor', 'limb-up'...). The
+// first menu line containing the earliest bit wins. The log says which line it clicked.
+function UseStaircase(spot: TPoint; wanted: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, w: String;
+  hovered, found: Boolean;
+begin
+  if NearestObject(['Staircase'], spot, 6, stairs) then
+    try
+      hovered := stairs.Hover([]);
+      if not hovered then
+        hovered := stairs.WalkHover([]);
+    except
+      Logger.Warn('Stairs: ' + GetExceptionMessage());
+    end
+  else
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  found := False;
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+
+  if not found then
+  begin
+    Logger.Warn('Stairs: none of ' + ToStr(wanted) + ' in the menu. It says: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Sleep(2500, 3500);
+  Result := True;
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+procedure SlowAntiban();
+var
+  i: Integer;
+begin
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+end;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// Coins in the inventory: the size of the stack (Count would only count the slots).
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= TOLL_COINS then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// ---------------------------------------------------------------- Lumbridge Castle bank
+
+// ---------------------------------------------------------------- Al Kharid toll gate (from the smelter)
+// Any walk that crosses the Lumbridge / Al Kharid fence goes through the toll gate first, by
+// trying it: "Open" (free with Prince Ali Rescue), the guard / "Pay-toll" with 10+ coins,
+// turning the camera if the gate can't be seen. Not let through: the long way round the fence.
+
+var
+  TOLL_GATE: TPoint = [13068, 37522];
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+  // the long way round the fence (no coins, no Prince Ali Rescue), game tiles
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+// Coins in the inventory (the stack size).
+function GateCoins(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= 10 then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free).
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through: we can't get through here (the caller walks the long way round).
+function CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not WebWalkRaw(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := GateCoins();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= 10 then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if GateMenu(gate, ['oll', 'Pay'], menu) then
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+    begin
+      Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+      Exit(True);
+    end;
+
+  // 4) no way through here
+  if coins < 10 then
+    Logger.Warn('Gate: not let through and fewer than 10 coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence (when the toll gate doesn't let us through).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not WebWalkRaw(path[0], 240000, 4) then
+      Exit;
+  end;
+
+  Logger.Info('Long way: walking round the fence.');
+  for i := start to High(path) do
+    if not WebWalkRaw(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + '.');
+      Exit;
+    end;
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+end;
+
+// WaspLib's walker with our time limit, through the toll gate first when the walk crosses the
+// Lumbridge / Al Kharid fence. True when we end within `reachTiles` of `dest`.
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  me: TPoint;
+  into: Boolean;
+begin
+  me := Map.Position();
+  if (me.X <> 0) and (me.X < RSTranslator.MapWidth) and (dest.X < RSTranslator.MapWidth) and
+     (InAlKharid(me) <> InAlKharid(dest)) and not InWilderness(dest) then
+  begin
+    into := InAlKharid(dest);
+    if not CrossTollGate() then
+    begin
+      Logger.Info('Walk: the toll gate is no good - taking the long way round the fence.');
+      if not WalkLongWay(into) then
+      begin
+        Logger.Warn('Walk: could not get past the Al Kharid fence (toll gate or the long way).');
+        Exit(False);
+      end;
+    end;
+  end;
+  CloseStrayInterface(True);
+  Result := WebWalkRaw(dest, ms, reachTiles);
+  // a window popped up during the walk (misclick): close it and walk again, once
+  if (not Result) and CloseStrayInterface(True) then
+  begin
+    Logger.Info('Walk: a window was in the way - closed it, walking again.');
+    Result := WebWalkRaw(dest, ms, reachTiles);
+  end;
+end;
+
+
+function OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+begin
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 180000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['op-floor', 'top floor', 'floor', 'limb-up', 'limb-u']) then
+      Exit;
+    SleepUntil(CurrentFloor() in [1, 2], 300, 6000);
+    if CurrentFloor() = 1 then
+    begin
+      Logger.Info('Bank: on the middle floor - climbing up once more.');
+      UseStaircase(Point(LUMBRIDGE_STAIRS.X + RSTranslator.MapWidth, LUMBRIDGE_STAIRS.Y), ['limb-up', 'limb-u', 'op-floor']);
+      SleepUntil(CurrentFloor() = 2, 300, 6000);
+    end;
+    if CurrentFloor() <> 2 then
+    begin
+      Logger.Warn('Bank: not on the top floor after climbing (we are at ' + Here() + ', floor ' + ToStr(CurrentFloor()) + ').');
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: opening the top-floor bank booth.');
+  if not NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+    Exit;
+  GuardWalk(45000);
+  try
+    Result := Bank.Open(booth, True);
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+end;
+
+function LeaveTopFloor(): Boolean;
+begin
+  Logger.Info('Travel: down the Lumbridge Castle stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  if UseStaircase(TOP_STAIRS, ['ottom-floor', 'ottom', 'floor', 'limb-down', 'limb-d']) then
+    SleepUntil(CurrentFloor() in [0, 1], 300, 6000);
+  if CurrentFloor() = 1 then
+  begin
+    Logger.Info('Travel: on the middle floor - climbing down once more.');
+    UseStaircase(Point(TOP_STAIRS.X - RSTranslator.MapWidth, TOP_STAIRS.Y), ['limb-down', 'limb-d', 'ottom']);
+    SleepUntil(CurrentFloor() = 0, 300, 6000);
+  end;
+  Result := CurrentFloor() = 0;
+end;
+
+
+// ---------------------------------------------------------------- bank search (from the smither)
+
+// The bank is showing search results: take the first slot whose hover text names `item`,
+// right-click it and pick Withdraw-All (or Withdraw-1 for the hammer).
+function WithdrawFromResults(item, option: String): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to 7 do
+  begin
+    Mouse.Move(Bank.Slots.Box(i));
+    Sleep(150, 300);
+    if Pos(item, MainScreen.UpText) = 0 then
+      Continue;
+    Mouse.Click(EMouseButton.RIGHT);
+    if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+      Continue;
+    Sleep(150, 350);
+    if ChooseOption.Select([option, Lowercase(option)]) then
+      Exit(True);
+    CancelMenu();
+  end;
+end;
+
+// Search the bank for `item` and withdraw it from the results. True when the inventory grew.
+function SearchAndWithdraw(item, option: String): Boolean;
+var
+  before: Integer;
+begin
+  before := Inventory.Slots.Count();
+  if not Bank.Search(item) then
+    Logger.Warn('Bank: search for ' + item + ' did not work.');
+  if not WithdrawFromResults(item, option) then
+    Logger.Warn('Bank: no ' + item + ' in the search results.');
+  Result := SleepUntil(Inventory.Slots.Count() > before, 100, 3000);
+  Bank.ClearSearch();
+end;
+
+// ---------------------------------------------------------------- the firemaker
+
+type
+  TBurner = record
+    MaxTime: UInt64;
+    BankSpot: TBankSpot;
+    Nearest: Boolean;               // the settings said "Nearest bank"
+    LogKind: Integer;               // index into LOG_NAMES (what we're burning now)
+    Best: Boolean;                  // "Best I can burn": move down when the bank runs out
+    IgnoreChecks: Boolean;          // debug
+    FMLevel: Integer;
+    BankObj: TObject;
+    HasBankObj: Boolean;
+    DebugTrip: Boolean;             // debug: no logs, walk to the burn spot and back anyway
+    OutThisTrip: Boolean;           // walked out to the burn spot since the last bank (or start)
+    Logs, Burnt, Trips, Failures, BurnFails: Integer;
+    StartItems: TItemArray;         // what you started with: never banked
+    FireTile: TPoint;               // the tile our fire is on (map pixels)...
+    FireAt: UInt64;                 // ...and when it last had logs put on (0 = no fire)
+    CampfireNearby: Boolean;
+    StopReason: String;
+    State: EBurnState;
+  end;
+
+function TBurner.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Self.BankSpot.Name,
+    LOG_NAMES[Self.LogKind],
+    ToStr(Self.Logs),
+    FormatNumber(Self.Logs / Logger.TimeRunning.Elapsed * HOUR),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+function TBurner.LogName(): String;
+begin
+  Result := LOG_NAMES[Self.LogKind];
+end;
+
+function TBurner.LogCount(): Integer;
+begin
+  Result := Inventory.Items.Count(Self.LogName());
+end;
+
+function TBurner.KeepItems(): TItemArray;
+begin
+  Result := [];
+  Result += 'Tinderbox';
+  Result += Self.StartItems;
+end;
+
+function TBurner.BurnSpot(): TPoint;
+begin
+  Result := Tile(Self.BankSpot.Burn.X, Self.BankSpot.Burn.Y);
+  Result.X += Self.BankSpot.BurnFloor * RSTranslator.MapWidth;   // upper floors sit to the right
+end;
+
+function TBurner.AtBurnSpot(): Boolean;
+begin
+  Result := (CurrentFloor() = Self.BankSpot.BurnFloor) and
+            (Map.Position().DistanceTo(Self.BurnSpot()) <= 6 * RSTranslator.TILE_SIZE);
+end;
+
+// Everything in the inventory at the start (except logs) is yours to keep: never banked.
+procedure TBurner.RememberStartItems();
+var
+  item, k: TItem;
+  l: String;
+  skip: Boolean;
+begin
+  Self.StartItems := [];
+  for item in Inventory.Items.RecognizeAll() do
+  begin
+    if item = '' then
+      Continue;
+    skip := False;
+    for l in LOG_NAMES do
+      if SameText(item, l) then
+        skip := True;
+    for k in Self.StartItems do
+      if SameText(item, k) then
+        skip := True;
+    if not skip then
+      Self.StartItems += item;
+  end;
+  if Self.StartItems <> [] then
+    Logger.Info('Keeping what you started with (never banked): ' + ToStr(Self.StartItems) + '.');
+end;
+
+// The bank closest to where we stand (straight line, ground floor). A bank on the other side of
+// the Al Kharid toll gate counts 60 tiles further; upstairs in Lumbridge Castle = Lumbridge.
+function NearestBank(): Integer;
+var
+  me: TPoint;
+  i: Integer;
+  best, d: Double;
+begin
+  Result := 0;
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit;
+  if me.X >= RSTranslator.MapWidth then
+  begin
+    for i := 0 to High(BANKS) do
+      if BANKS[i].Lumbridge then
+        Exit(i);
+  end;
+  best := 1000000000;
+  for i := 0 to High(BANKS) do
+  begin
+    d := me.DistanceTo(Tile(BANKS[i].Bank.X, BANKS[i].Bank.Y));
+    if BANKS[i].AlKharid <> InAlKharid(me) then
+      d += 60 * RSTranslator.TILE_SIZE;   // the other side of the toll gate: only if it's much closer
+    if d < best then
+    begin
+      best := d;
+      Result := i;
+    end;
+  end;
+end;
+
+procedure TBurner.Init();
+begin
+  Logger.Setup('DMB''s F2P Firemaker');
+  ProgressReport.Setup(
+    'DMB''s F2P Firemaker',
+    ['Script runtime:', 'Bank:', 'Logs:', 'Burnt:', 'Burnt/H:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+  StartListeners(300);
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  Self.FMLevel := Stats.GetLevel(ESkill.FIREMAKING, False);
+  Inventory.Open();
+  Logger.Info('Firemaking level: ' + ToStr(Self.FMLevel) + '.');
+  Self.RememberStartItems();
+
+  if (Self.FMLevel > 0) and (Self.FMLevel < LOG_LEVELS[Self.LogKind]) then
+  begin
+    if not Self.IgnoreChecks then
+      raise LOG_NAMES[Self.LogKind] + ' need ' + ToStr(LOG_LEVELS[Self.LogKind]) + ' Firemaking (you have ' + ToStr(Self.FMLevel) + ').';
+    Logger.Warn('DEBUG: ' + LOG_NAMES[Self.LogKind] + ' need ' + ToStr(LOG_LEVELS[Self.LogKind]) + ' Firemaking - carrying on.');
+  end;
+
+  Logger.Info('Map: loading the areas (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  Map.Walker.ScreenWalk := False;
+
+  if Self.Nearest then
+  begin
+    Self.BankSpot := BANKS[NearestBank()];
+    Logger.Info('Nearest bank to where you stand (' + Here() + '): ' + Self.BankSpot.Name + '.');
+  end;
+  if Self.Best then
+    Logger.Info('Logs: the best you can burn - starting with ' + Self.LogName() + '.')
+  else
+    Logger.Info('Logs: ' + Self.LogName() + '.');
+  Logger.Info('Bank: ' + Self.BankSpot.Name + ', burning at game (' + ToStr(Self.BankSpot.Burn.X) + ', ' +
+              ToStr(Self.BankSpot.Burn.Y) + ').');
+
+  if not Self.BankSpot.Lumbridge then
+  begin
+    Self.HasBankObj := NearestObject(['Bank booth', 'Bank Booth', 'Bank chest', 'Grand Exchange booth'],
+                                     Tile(Self.BankSpot.Bank.X, Self.BankSpot.Bank.Y), 12, Self.BankObj);
+    if not Self.HasBankObj then
+      Logger.Warn('Bank: no booth near ' + Self.BankSpot.Name + ' - will use WaspLib''s nearest bank.');
+  end;
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.FIREMAKING, ESkill.TOTAL];
+  SlowAntiban();
+  Logger.Info('Start: we are at ' + Here() + '.');
+end;
+
+// ---------------------------------------------------------------- bank
+
+procedure TBurner.OpenBank();
+var
+  dest: TPoint;
+  opened: Boolean;
+begin
+  if Self.BankSpot.Lumbridge then
+    opened := OpenLumbridgeBank()
+  else
+  begin
+    if CurrentFloor() > 0 then
+      LeaveTopFloor();
+    dest := Tile(Self.BankSpot.Bank.X, Self.BankSpot.Bank.Y);
+    if Map.Position().DistanceTo(dest) > 6 * RSTranslator.TILE_SIZE then
+    begin
+      Logger.Info('Bank: walking to ' + Self.BankSpot.Name + ' (' +
+                  ToStr(Round(Map.Position().DistanceTo(dest) / RSTranslator.TILE_SIZE)) + ' tiles).');
+      SafeWebWalk(dest, 300000, 4);
+    end;
+    GuardWalk(45000);
+    try
+      if Self.HasBankObj then
+        opened := Bank.Open(Self.BankObj, True)
+      else
+        opened := Bank.Open(True);
+    except
+      Logger.Warn('Bank: opening failed: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end;
+
+  if opened or Bank.IsOpen() then
+    Exit;
+  Inc(Self.Failures);
+  Logger.Warn('Bank: could not open the bank (we are at ' + Here() + ').');
+  if Self.Failures >= 4 then
+    Self.StopReason := 'Could not open the ' + Self.BankSpot.Name + ' bank. Please post this log in a GitHub issue.';
+end;
+
+// Take `item` out of the bank: WaspLib's own Bank.Withdraw first; only if that gets nothing,
+// search the bank by name and pick it by its hover text. True when the inventory has some.
+function WithdrawItem(item: String; amount: Integer): Boolean;
+var
+  option: String;
+begin
+  try
+    Bank.Withdraw(new TBankItem(item, amount));
+  except
+    Logger.Warn('Bank: ' + GetExceptionMessage());
+  end;
+  if SleepUntil(Inventory.Items.Count(item) > 0, 100, 3000) then
+    Exit(True);
+  Logger.Info('Bank: WaspLib''s withdraw got no ' + item + ' - searching the bank for it.');
+  if amount = 1 then
+    option := 'Withdraw-1'
+  else
+    option := 'Withdraw-All';
+  SearchAndWithdraw(item, option);
+  Result := Inventory.Items.Count(item) > 0;
+end;
+
+// The first log in the inventory, by its hover text: is it the kind we wanted?
+function TBurner.LogsAreRight(): Boolean;
+var
+  i: Integer;
+  text: String;
+begin
+  for i := 0 to 27 do
+  begin
+    if not Inventory.Slots.IsUsed(i) then
+      Continue;
+    Mouse.Move(Inventory.Slots.Box(i));
+    Sleep(150, 250);
+    text := MainScreen.UpText;
+    if Pos('ogs', text) = 0 then
+      Continue;                        // the tinderbox, or something of yours
+    if Self.LogKind = 0 then
+      Exit((Pos('Oak', text) = 0) and (Pos('Willow', text) = 0) and (Pos('Yew', text) = 0));
+    Exit(Pos(Self.LogName(), text) > 0);
+  end;
+  Result := True;                      // no logs at all: nothing wrong
+end;
+
+// Take out the logs. "Best I can burn": the best kind our level allows, moving down while the
+// bank has none of it. True when we have logs.
+function TBurner.WithdrawLogs(): Boolean;
+var
+  k, top: Integer;
+begin
+  if not Self.Best then
+  begin
+    Logger.Info('Bank: taking out ' + Self.LogName() + '.');
+    Exit(WithdrawItem(Self.LogName(), QUANTITY_ALL));
+  end;
+
+  top := Self.LogKind;
+  for k := top downto 0 do
+  begin
+    Self.LogKind := k;
+    Logger.Info('Bank: taking out ' + Self.LogName() + '.');
+    if WithdrawItem(Self.LogName(), QUANTITY_ALL) then
+      Exit(True);
+    if k > 0 then
+      Logger.Info('Bank: no ' + Self.LogName() + ' left - trying ' + LOG_NAMES[k - 1] + '.');
+  end;
+  Self.LogKind := top;
+end;
+
+procedure TBurner.DoBank();
+begin
+  Self.DebugTrip := False;
+  Self.OutThisTrip := False;          // new logs: walk out to the burn spot again
+  if Inventory.Items.ContainsDifferent(Self.KeepItems()) then
+  begin
+    if Bank.DepositDifferent(Self.KeepItems()) then
+      SleepUntil(not Inventory.Items.ContainsDifferent(Self.KeepItems()), 100, 3000);
+  end;
+
+  // the tinderbox first (never banked)
+  if Inventory.Items.Count('Tinderbox') = 0 then
+  begin
+    Logger.Info('Bank: taking out a tinderbox.');
+    WithdrawItem('Tinderbox', 1);
+    if Inventory.Items.Count('Tinderbox') = 0 then
+    begin
+      if not Self.IgnoreChecks then
+      begin
+        Self.StopReason := 'No tinderbox in the inventory or the bank.';
+        Bank.Close();
+        Exit;
+      end;
+      Logger.Warn('DEBUG: no tinderbox in the bank either - carrying on.');
+    end;
+  end;
+
+  if not Self.WithdrawLogs() then
+  begin
+    if Self.IgnoreChecks then
+    begin
+      Logger.Warn('DEBUG: no ' + Self.LogName() + ' in the bank - walking to the burn spot anyway.');
+      Self.DebugTrip := True;
+    end
+    else
+    begin
+      if Self.Best then
+        Self.StopReason := 'The bank is out of logs you can burn.'
+      else
+        Self.StopReason := 'The bank is out of ' + Self.LogName() + '.';
+      Bank.Close();
+      Exit;
+    end;
+  end
+  else if not Self.LogsAreRight() then
+  begin
+    Logger.Error('Bank: took the WRONG logs (wanted ' + Self.LogName() + ') - putting them back.');
+    Bank.DepositDifferent(Self.KeepItems());
+    Self.StopReason := 'Withdrew the wrong logs instead of ' + Self.LogName() + '. Please post this log in a GitHub issue.';
+    Bank.Close();
+    Exit;
+  end;
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  if not Self.DebugTrip then
+    Logger.Info('Bank: ' + ToStr(Self.LogCount()) + ' ' + Self.LogName() + '. Trip ' + ToStr(Self.Trips) + '. Out to burn them.');
+  Bank.Close();
+  SleepUntil(not Bank.IsOpen(), 100, 3000);
+end;
+
+// ---------------------------------------------------------------- out of the bank
+
+procedure TBurner.ToBurnSpot();
+begin
+  // the burn spot's floor: down the Lumbridge stairs for the others; up them for Lumbridge's
+  // own spot (that's next to the top-floor bank, so it goes via the bank)
+  if CurrentFloor() <> Self.BankSpot.BurnFloor then
+  begin
+    if Self.BankSpot.BurnFloor = 0 then
+    begin
+      if not LeaveTopFloor() then
+      begin
+        Inc(Self.Failures);
+        if Self.Failures >= 4 then
+          Self.StopReason := 'Could not get down the Lumbridge Castle stairs. Please post this log in a GitHub issue.';
+        Exit;
+      end;
+    end
+    else
+    begin
+      Logger.Info('Travel: the burn spot is on the top floor - up the Lumbridge Castle stairs.');
+      if not OpenLumbridgeBank() then
+      begin
+        Inc(Self.Failures);
+        if Self.Failures >= 4 then
+          Self.StopReason := 'Could not get up the Lumbridge Castle stairs. Please post this log in a GitHub issue.';
+      end;
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Travel: out of the bank to the burn spot (' +
+              ToStr(Round(Map.Position().DistanceTo(Self.BurnSpot()) / RSTranslator.TILE_SIZE)) + ' tiles).');
+  // the spot itself (you checked a fire can be lit there)
+  if SafeWebWalk(Self.BurnSpot(), 180000, 1) or
+     Self.AtBurnSpot() then
+  begin
+    Self.Failures := 0;
+    Self.OutThisTrip := True;
+    Logger.Info('Travel: at the burn spot.');
+    Map.Walker.WaitMoving();
+    if Self.DebugTrip then
+    begin
+      Logger.Warn('DEBUG: at the burn spot with no logs - back to the bank.');
+      Self.DebugTrip := False;
+      Sleep(1000, 2000);
+    end;
+    Exit;
+  end;
+  Inc(Self.Failures);
+  if Self.Failures >= 3 then
+    Self.StopReason := 'Could not walk to the burn spot (we are at ' + Here() + '). Please post this log in a GitHub issue.';
+end;
+
+// ---------------------------------------------------------------- burning
+// Light a fire with the tinderbox, then select the logs in the inventory and click the fire:
+// the game adds the logs to it one after another until they're all burnt. Fires aren't in
+// WaspLib's map data, so the bot remembers the tile it lit the fire on and clicks exactly there
+// (it hovers that tile and checks the hover text says Fire) - no searching the screen.
+
+// Where a tile (map pixels) is on the game screen, from where we stand.
+function TileOnScreen(tile: TPoint; out pt: TPoint): Boolean;
+var
+  mm: TPoint;
+begin
+  mm := TWalker.Point2MM(Map.Position(), tile, Minimap.CompassRadians);
+  pt := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  Result := MainScreen.Bounds.Contains(pt);
+end;
+
+// The newest chat line, lower case ('' if none).
+function LastChatLine(): String;
+begin
+  try
+    Result := Lowercase(Chat.GetMessage(High(Chat.MessageLines)));
+  except
+    Result := '';
+  end;
+end;
+
+// "The fire catches and the logs begin to burn." (loose: the chat reader can garble a letter)
+function FireCaughtMessage(line: String): Boolean;
+begin
+  Result := (Pos('fire catches', line) > 0) or (Pos('begin to burn', line) > 0) or
+            (Pos('logs begin', line) > 0);
+end;
+
+// "There's a Forester's Campfire nearby, help tend to that one or move further away." - the
+// game won't let us light a new fire next to one. (Matched loosely: the chat reader can garble
+// a letter.)
+function CampfireMessage(line: String): Boolean;
+begin
+  Result := (Pos('campfire nearby', line) > 0) or (Pos('tend to that one', line) > 0) or
+            (Pos('move further away', line) > 0);
+end;
+
+// Is there a fire on `tile`? Hovers a few points of the tile and reads the hover text.
+function FireOnTile(tile: TPoint): Boolean;
+var
+  pt, p: TPoint;
+  k: Integer;
+begin
+  if not TileOnScreen(tile, pt) then
+    Exit;
+  for k := 0 to 4 do
+  begin
+    case k of
+      0: p := pt;
+      1: p := Point(pt.X, pt.Y - 10);
+      2: p := Point(pt.X - 8, pt.Y - 5);
+      3: p := Point(pt.X + 8, pt.Y - 5);
+      4: p := Point(pt.X, pt.Y + 6);
+    end;
+    p := Point(p.X + Random(-2, 2), p.Y + Random(-2, 2));
+    if not MainScreen.Bounds.Contains(p) then
+      Continue;
+    Mouse.Move(p);
+    if MainScreen.IsUpText(['Fire', 'fire', 'Campfire'], True, 0.85, 60) then
+      Exit(True);
+  end;
+end;
+
+// Our fire still going? Fed less than ~2 minutes ago (a Forester's Campfire lasts a while)
+// and close by.
+function TBurner.HaveFire(): Boolean;
+begin
+  Result := (Self.FireAt > 0) and (GetTimeRunning() - Self.FireAt < 120000) and
+            (Map.Position().DistanceTo(Self.FireTile) <= 8 * RSTranslator.TILE_SIZE);
+end;
+
+// Light a fire where we stand. "You can't light a fire here." -> step a few tiles and try
+// again (up to 4 spots). True = lit; FireTile is where it burns.
+function TBurner.LightFire(): Boolean;
+var
+  tries, before, cant, caught: Integer;
+  spot: TPoint;
+  lastLine: String;
+  lit: Boolean;
+begin
+  for tries := 1 to 4 do
+  begin
+    Map.Walker.WaitMoving();
+    spot := Map.Position();
+    before := Self.LogCount();
+    cant := Chat.CountNewMessage('You can''t light a fire here.');
+    lastLine := LastChatLine();
+    Self.CampfireNearby := False;
+    caught := Chat.CountNewMessage('The fire catches and the logs begin to burn.');
+    Inventory.Combine('Tinderbox', Self.LogName());
+    Logger.Info('Burn: lighting a fire...');
+    // The log leaves the inventory straight away (it's put on the ground) - that is NOT the
+    // fire. Lit = the game says "The fire catches..." or we step off the spot (the player
+    // always steps aside once the fire is going). Low Firemaking can take many tries: up to
+    // 30 s. "You can't light a fire here." = move; a Forester's Campfire nearby = use that one.
+    SleepUntil((Chat.CountNewMessage('The fire catches and the logs begin to burn.') > caught) or
+               ((LastChatLine() <> lastLine) and FireCaughtMessage(LastChatLine())) or
+               ((Self.LogCount() < before) and (Map.Position().DistanceTo(spot) >= RSTranslator.TILE_SIZE)) or
+               (Chat.CountNewMessage('You can''t light a fire here.') > cant) or
+               ((LastChatLine() <> lastLine) and CampfireMessage(LastChatLine())), 250, 30000);
+    if (Self.LogCount() >= before) and CampfireMessage(LastChatLine()) and (LastChatLine() <> lastLine) then
+    begin
+      Logger.Info('Burn: the game says there''s a Forester''s Campfire nearby.');
+      Self.CampfireNearby := True;
+      Exit(False);
+    end;
+    lit := (Chat.CountNewMessage('The fire catches and the logs begin to burn.') > caught) or
+           ((LastChatLine() <> lastLine) and FireCaughtMessage(LastChatLine())) or
+           ((Self.LogCount() < before) and (Map.Position().DistanceTo(spot) >= RSTranslator.TILE_SIZE));
+    if (not lit) and (Self.LogCount() < before) and
+       (Chat.CountNewMessage('You can''t light a fire here.') <= cant) then
+    begin
+      // the log is on the ground but no fire yet after 30 s: still trying - give it 20 s more
+      Logger.Info('Burn: still trying to light it...');
+      lit := SleepUntil((Chat.CountNewMessage('The fire catches and the logs begin to burn.') > caught) or
+                        ((LastChatLine() <> lastLine) and FireCaughtMessage(LastChatLine())) or
+                        (Map.Position().DistanceTo(spot) >= RSTranslator.TILE_SIZE), 250, 20000);
+      if not lit then
+      begin
+        Logger.Info('Burn: no fire after 50 s - picking a new spot.');
+        StepDirection(Random(-1, 1), Random(-1, 1) or 1, Random(2, 4));
+        Continue;
+      end;
+    end;
+    if lit then
+    begin
+      Self.FireTile := spot;
+      Self.FireAt := GetTimeRunning();
+      Inc(Self.Burnt);
+      Inc(Self.Logs);
+      Logger.Info('Burn: fire lit.');
+      // let the step aside finish and the fire settle before touching anything
+      SleepUntil(not Minimap.IsPlayerMoving(), 150, 3000);
+      Sleep(1500, 2200);
+      // look at it: hover the fire's tile and read the hover text
+      if FireOnTile(spot) then
+        Logger.Info('Burn: fire checked - the hover text on its tile says Fire.')
+      else
+        Logger.Warn('Burn: no Fire hover text on its tile yet - will look again when adding the logs.');
+      Exit(True);
+    end;
+    if Chat.CountNewMessage('You can''t light a fire here.') <= cant then
+    begin
+      Logger.Info('Burn: the fire didn''t catch in 30 s - trying again here.');
+      Continue;
+    end;
+    Logger.Info('Burn: can''t light a fire here - moving a few tiles.');
+    StepDirection(Random(-1, 1), Random(-1, 1) or 1, Random(2, 4));
+  end;
+end;
+
+// Select the logs, then click our fire's tile once the hover text says Fire.
+function TBurner.UseLogsOnFire(): Boolean;
+var
+  pt, p: TPoint;
+  k, sel: Integer;
+begin
+  if not TileOnScreen(Self.FireTile, pt) then
+  begin
+    Logger.Warn('Burn: the fire isn''t on the screen.');
+    Exit;
+  end;
+  if not Inventory.Select(Self.LogName(), True) then
+    Exit;
+  Sleep(300, 600);
+
+  for k := 0 to 9 do
+  begin
+    if k = 5 then
+      Sleep(800, 1200);             // not seen yet: give the fire a moment, then look again
+    if (k = 5) and not TileOnScreen(Self.FireTile, pt) then
+      Break;
+    case k mod 5 of
+      0: p := pt;
+      1: p := Point(pt.X, pt.Y - 10);
+      2: p := Point(pt.X - 8, pt.Y - 5);
+      3: p := Point(pt.X + 8, pt.Y - 5);
+      4: p := Point(pt.X, pt.Y + 6);
+    end;
+    p := Point(p.X + Random(-2, 2), p.Y + Random(-2, 2));
+    if not MainScreen.Bounds.Contains(p) then
+      Continue;
+    Mouse.Move(p);
+    if MainScreen.IsUpText(['Fire', 'fire', 'Campfire'], True, 0.85, 60) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+  end;
+
+  // not found: unselect the logs again
+  Logger.Warn('Burn: no fire at its tile (burnt out?).');
+  sel := Inventory.GetSelected();
+  if sel > -1 then
+    Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+end;
+
+procedure TBurner.DoBurn();
+var
+  before, last: Integer;
+begin
+  if Inventory.Items.Count('Tinderbox') = 0 then
+  begin
+    Logger.Warn('Burn: no tinderbox - back to the bank for one.');
+    Self.FireAt := 0;
+    Self.OpenBank();
+    if Bank.IsOpen() then
+      Self.DoBank();
+    Exit;
+  end;
+
+  // 1) a fire to put the logs on (ours, still going, close by) - or light one
+  if not Self.HaveFire() then
+    if not Self.LightFire() then
+    begin
+      Inc(Self.BurnFails);
+      if Self.CampfireNearby then
+      begin
+        // our own fire from the last trip turned into a Forester's Campfire: tend that one
+        if (Self.FireTile.X <> 0) and
+           (Map.Position().DistanceTo(Self.FireTile) <= 10 * RSTranslator.TILE_SIZE) then
+        begin
+          Logger.Info('Burn: it''s our fire from before - putting the logs on that.');
+          Self.FireAt := GetTimeRunning();
+        end
+        else
+        begin
+          Logger.Info('Burn: not ours / not known - moving further away to light one.');
+          StepDirection(Random(-1, 1), Random(-1, 1) or 1, Random(8, 11));
+          Sleep(800, 1500);
+          Exit;
+        end;
+      end
+      else
+      begin
+        Sleep(800, 1500);
+        Exit;
+      end;
+    end;
+  if Self.LogCount() = 0 then
+    Exit;
+
+  // 2) all the logs onto it
+  before := Self.LogCount();
+  if not (Self.UseLogsOnFire() and SleepUntil(Self.LogCount() < before, 200, 10000)) then
+  begin
+    Inc(Self.BurnFails);
+    Self.FireAt := 0;               // assume it's gone: light a new one
+    if Self.CampfireNearby then
+      Self.FireTile := Point(0, 0); // ...and it wasn't where we thought: move away next time
+    Sleep(800, 1500);
+    Exit;
+  end;
+  Logger.Info('Burn: putting ' + ToStr(before) + ' ' + Self.LogName() + ' on the fire.');
+  Self.BurnFails := 0;
+
+  // they keep going on one after another while the logs keep going down
+  repeat
+    last := Self.LogCount();
+    Self.FireAt := GetTimeRunning();
+    Activity.Restart();
+    if last = 0 then
+      Break;
+    if Chat.LeveledUp() then
+    begin
+      Chat.HandleLevelUp();
+      Inventory.Open();
+      Break;                        // the level-up stops it: put the rest on again
+    end;
+  until not SleepUntil(Self.LogCount() < last, 200, 9000);
+  Self.Burnt += before - Self.LogCount();
+  Self.Logs += before - Self.LogCount();
+end;
+
+// ---------------------------------------------------------------- main loop
+
+function ReallyInWilderness(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InWilderness(Map.Position()) then
+      Exit(False);
+    if i < 3 then
+      Sleep(700, 900);
+  end;
+  Result := True;
+end;
+
+function TBurner.GetState(): EBurnState;
+begin
+  if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+  begin
+    if Self.StopReason = '' then
+      Self.StopReason := 'Stopped at the Wilderness. Move the character out and restart.';
+    Exit(EBurnState.STOP);
+  end;
+  if Self.StopReason <> '' then
+    Exit(EBurnState.STOP);
+  if Self.BurnFails >= 8 then
+  begin
+    Self.StopReason := 'Could not light or feed a fire 8 times in a row. Please post this log in a GitHub issue.';
+    Exit(EBurnState.STOP);
+  end;
+  if Activity.IsFinished then
+    Exit(EBurnState.NO_ACTIVITY);
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+    Exit(EBurnState.MAX_TIME);
+  if not Client.IsLoggedIn() then
+    Exit(EBurnState.LOGIN);
+  if Chat.LeveledUp() then
+    Exit(EBurnState.LEVEL_UP);
+  if Bank.IsOpen() then
+    Exit(EBurnState.BANK);
+
+  // logs (or a debug trip): out of the bank and burn them
+  if (Self.LogCount() > 0) or Self.DebugTrip then
+  begin
+    if Self.DebugTrip then
+      Exit(EBurnState.TO_SPOT);
+    // always walk out to the burn spot first (you can't light fires inside a bank - a bank can
+    // be just a few tiles from the spot); after that it may move around while burning
+    if (not Self.OutThisTrip) or (CurrentFloor() <> Self.BankSpot.BurnFloor) or
+       (Map.Position().DistanceTo(Self.BurnSpot()) > 14 * RSTranslator.TILE_SIZE) then
+      Exit(EBurnState.TO_SPOT);
+    Exit(EBurnState.BURN);
+  end;
+  Result := EBurnState.OPEN_BANK;
+end;
+
+procedure TBurner.Run();
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    if Self.State <> EBurnState.BURN then
+      Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      EBurnState.LOGIN: DoLoginSafe();
+      EBurnState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+          Inventory.Open();
+        end;
+      EBurnState.OPEN_BANK: Self.OpenBank();
+      EBurnState.BANK: Self.DoBank();
+      EBurnState.TO_SPOT: Self.ToBurnSpot();
+      EBurnState.BURN: Self.DoBurn();
+      EBurnState.NO_ACTIVITY, EBurnState.MAX_TIME, EBurnState.STOP: Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  if Self.StopReason <> '' then
+    Logger.Error('Stopped: ' + Self.StopReason)
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+// ---------------------------------------------------------------- settings window
+
+var
+  Burner: TBurner;
+  BurnForm: TScriptForm;
+  GuiFMLevel: Integer;
+  RuntimeEdit: TLazEdit;
+  BankSelector, LogSelector: TLazComboBox;
+  DebugBox: TLazCheckBox;
+  StartLocked: String;
+
+// The best logs a level can burn (index into LOG_NAMES).
+function BestLogFor(level: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  if level <= 0 then
+    Exit(High(LOG_NAMES));
+  for i := 0 to High(LOG_NAMES) do
+    if level >= LOG_LEVELS[i] then
+      Result := i;
+end;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes, pick: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Burner.MaxTime := minutes * MINUTE;
+
+  pick := Max(0, BankSelector.ItemIndex);
+  Burner.Nearest := pick = 0;
+  if pick > 0 then
+    Burner.BankSpot := BANKS[pick - 1];
+
+  pick := Max(0, LogSelector.ItemIndex);
+  Burner.Best := pick = 0;
+  if Burner.Best then
+    Burner.LogKind := BestLogFor(GuiFMLevel)
+  else
+    Burner.LogKind := pick - 1;
+
+  Burner.IgnoreChecks := DebugBox.Checked;
+  StartLocked := '';
+  if (not Burner.IgnoreChecks) and (GuiFMLevel > 0) and (GuiFMLevel < LOG_LEVELS[Burner.LogKind]) then
+    StartLocked := 'needs ' + ToStr(LOG_LEVELS[Burner.LogKind]) + ' Firemaking (you have ' + ToStr(GuiFMLevel) + ')';
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i: Integer;
+  line: String;
+begin
+  if GuiFMLevel > 0 then
+    Self.Setup('DMB''s F2P Firemaker - Firemaking ' + ToStr(GuiFMLevel))
+  else
+    Self.Setup('DMB''s F2P Firemaker');
+  tab := Self.CreateTab('Firemaker');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run, in minutes.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  BankSelector := TLazComboBox.CreateEx(tab, 'Bank:', 'Where to get the logs. It burns them a few tiles outside.', 40, 110, 360);
+  BankSelector.Items.Add('Nearest bank (to where you stand at Start)');
+  for i := 0 to High(BANKS) do
+    BankSelector.Items.Add(BANKS[i].Name);
+  BankSelector.ItemIndex := 0;
+
+  LogSelector := TLazComboBox.CreateEx(tab, 'Logs:', 'Which logs to burn. They must be in your bank.', 40, 180, 360);
+  LogSelector.Items.Add('Best I can burn (moves down when the bank runs out)');
+  for i := 0 to High(LOG_NAMES) do
+  begin
+    line := LOG_NAMES[i] + ' (Firemaking ' + ToStr(LOG_LEVELS[i]) + ')';
+    if (GuiFMLevel > 0) and (GuiFMLevel < LOG_LEVELS[i]) then
+      line += ' - LOCKED';
+    LogSelector.Items.Add(line);
+  end;
+  LogSelector.ItemIndex := 0;
+
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the level and item checks',
+    'For testing the walking only. LOCKED logs start anyway, and no logs / tinderbox only give a warning: it still walks to the burn spot and back to the bank, round and round.', 40, 250);
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  SetupBanks();
+
+  Logger.Info('Reading your Firemaking level before opening the settings...');
+  try
+    if not Client.IsLoggedIn() then
+      DoLoginSafe();
+    GuiFMLevel := Stats.GetLevel(ESkill.FIREMAKING, False);
+    Inventory.Open();
+  except
+    Logger.Warn('Could not read the Firemaking level: ' + GetExceptionMessage());
+  end;
+
+  BurnForm.Init();
+  SetClientInputLocked(True);
+  try
+    if StartLocked <> '' then
+      Logger.Error(LOG_NAMES[Burner.LogKind] + ' is locked: ' + StartLocked +
+                   '. Pick other logs (or tick the debug box to run it anyway).')
+    else
+      Burner.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

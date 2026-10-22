@@ -1,0 +1,4273 @@
+{$I WaspLib/main.simba}
+
+
+// Log in, or back in after a disconnect, with WaspLib's own login: it clicks "Play" on the
+// welcome screen (the Jagex launcher - no password needed), "Ok" after a disconnect and "Click
+// here to play" in the lobby, and does nothing when we're already logged in. With no account
+// saved in WaspLib it would stop the script ("No profiles declared"), so then it gets an empty
+// one and only clicks through those screens.
+var
+  LoginFails: Integer;
+
+function DoLoginSafe(): Boolean;
+var
+  p: TProfile;
+begin
+  if Client.IsLoggedIn() then
+    Exit(True);
+  try
+    if Length(Profiles) > 0 then
+      Result := Login.DoLogin()
+    else
+    begin
+      p.Name := 'no password';
+      p.Active := True;
+      Result := Login.DoLogin(p);
+    end;
+  except
+    Logger.Warn('Login: ' + GetExceptionMessage());
+  end;
+  Result := Result or Client.IsLoggedIn();
+  if Result then
+  begin
+    LoginFails := 0;
+    Logger.Info('Login: logged in.');
+    Exit;
+  end;
+  Inc(LoginFails);
+  Logger.Warn('Login: could not log in (try ' + ToStr(LoginFails) + ' of 5).');
+  if LoginFails >= 5 then
+    raise 'Could not log back in 5 times in a row. If the game asks for a password, save your account in WaspLib (or log in yourself and start the script again).';
+  Sleep(5000, 10000);
+end;
+
+// =============================================================================================
+// DMB's F2P Miner                                       Simba 2.0 + WaspLib (Includes\WaspLib)
+// =============================================================================================
+//
+// FILES (all in Scripts\)
+//   dmb_f2p_miner.simba       this script
+//   images\dmb_f2p_miner.png  the picture on the settings window (optional)
+//
+// HOW TO USE
+//   Start it logged in (or at the login screen). It reads your Mining and Crafting levels,
+//   then opens the settings window. Pick a mine, tick the ores, set the runtime, press Start.
+//   While it runs, RuneLite ignores your own mouse and keyboard; they come back when it stops.
+//   It can start from anywhere in the F2P area: it walks to the mine itself.
+//
+// SETTINGS WINDOW
+//   Runtime (minutes)   when time's up it banks what it has, then stops
+//   Mine                every mine is listed; ones you lack the level for say LOCKED and
+//                       can't be started
+//   Ores                only the ores that mine has (and you have the level for) can be ticked
+//   Power mine          drop ores + gems instead of banking (not for rune essence)
+//   Rune Mysteries      rune essence only: needed for Aubury's teleport
+//
+// MINES                          ORES                                    BANK
+//   South-east Varrock           Copper, Tin, Iron                       nearest *
+//   South-west Varrock           Clay, Tin, Iron, Silver                 nearest *
+//   Barbarian Village            Tin, Coal                               nearest *
+//   Rimmington                   Clay, Copper, Tin, Iron, Gold           nearest *
+//   Lumbridge Swamp (east)       Copper, Tin                             Lumbridge Castle
+//   Lumbridge Swamp (west)       Coal, Mithril, Adamant                  nearest *
+//   Al Kharid                    all of them                             Al Kharid
+//   Mining Guild (F2P part)      Iron, Coal, Mithril, Adamant            Falador East
+//     60 Mining; the members side is visible but never mined
+//   Dwarven Mine                 (from WaspLib's data - see the log)    Falador East
+//   Crafting Guild               Silver, Gold (Clay)                     Falador East
+//     40 Crafting + brown apron worn; the guild's own bank is members-only
+//   Rune essence mine            Rune essence                            Varrock East
+//     Rune Mysteries; Aubury teleports you in, a portal brings you back
+//   * nearest = the shortest walk out of: Varrock East/West, Grand Exchange, Edgeville,
+//     Draynor, Falador East/West, Al Kharid, Lumbridge Castle (top floor, via the stairs)
+//
+// ITEMS (checked at the bank: a missing one is taken out; only if the bank has none either
+// does the bot stop)
+//   Pickaxe       the best one your Mining level can use; never banked or dropped
+//   Brown apron   Crafting Guild: taken out and worn
+//   Coins         Al Kharid toll gate: 10+ kept in the inventory (never banked); without coins
+//                 or Prince Ali Rescue it walks the long way round the fence
+//
+// WHICH ROCK IT MINES (several ores ticked)
+//   Strict priority, best ore first: adamant, mithril, gold, coal, silver, iron, tin, copper,
+//   clay. It mines the nearest ready rock of the best ore; only when all of those are mined
+//   out does it move down to the next ore. Before every rock it checks again, so it goes back
+//   to a better ore as soon as one of its rocks is due to have respawned.
+//
+// HOW IT GETS AROUND
+//   WaspLib does most of it: the map, the walker, the rocks (from the game's object data), the
+//   banks, doors, stairs and ladders. On top of that:
+//   - recorded routes: the long way round the Al Kharid fence, and the Varrock East bank ->
+//     Aubury route (rune essence backup)
+//   - local walking: main-screen tile clicks and hand walking in the essence part, and blind
+//     walking inside the Crafting Guild (WaspLib's walker sees its inside as cut off)
+//   - when a walk fails, in order: long route steps filled in every 10 tiles -> not moved for
+//     8 s = stop that walk -> go via the mine's bank -> get out of a building (walk out, open
+//     a door or gate) -> Home Teleport to Lumbridge -> stop with the reason in the log
+//
+// SAFETY
+//   - Never goes into the Wilderness: a walk heading there is stopped; if it finds itself in
+//     it, it logs out and stops.
+//   - Home Teleport: remembers its 30 min cooldown, runs from anything attacking it, recasts.
+//   - Repeated failures (a door that won't open, a bank it can't reach...) stop the script
+//     with the reason in the log, instead of looping forever.
+// =============================================================================================
+
+type
+  EMinerState = enum(
+    LOGIN,
+    LEVEL_UP,
+    BANK,
+    DROP,
+    GO_TO_MINE,
+    MINE,
+    NO_ACTIVITY,
+    MAX_TIME,
+    STOP
+  );
+
+  // one mine in the list
+  TMineInfo = record
+    Name: String;
+    Center, BankSpot: TPoint;   // game tiles (x, y)
+    Radius: Integer;            // rocks within this many tiles of Center belong to the mine
+    Ores: TStringArray;         // ores it has (for the GUI hint)
+    Allowed: TBox;              // optional (game tiles): only rocks inside this box are used.
+                                // For mines next to a members area (Mining Guild).
+    BankName: String;
+    Note: String;
+    ReqLevel: Integer;          // Mining level needed to get in (0 = none)
+    ReqCraft: Integer;          // Crafting level needed to get in (0 = none), + a brown apron worn
+    FixedBank: Boolean;         // keep BankName as it is instead of picking the nearest bank
+    Underground: Boolean;       // reached by a ladder or a door+staircase (EntranceKind below):
+                                 // Entrance = surface ladder/staircase spot (going down),
+    Entrance, Inside: TPoint;   // Inside = where it puts you below (going up) (map pixels)
+    EntranceKind: Integer;      // EK_LADDER (default) or EK_DOOR_STAIRS
+    Door: TPoint;               // EK_DOOR_STAIRS only: the door next to the down-staircase
+  end;
+
+  TRock = record
+    Obj: TObject;
+    Spot: TPoint;
+    Ore: Integer;               // index into ORE_* arrays
+    FreeAt: UInt64;             // don't try before this time (respawning)
+  end;
+
+  TMiner = record
+    MaxTime: UInt64;
+    Mine: TMineInfo;
+    Want: array of Boolean;     // per ore
+    PowerMine: Boolean;
+    LastOre: Integer;           // the ore PickRock chose last (for the log), -1 = none yet
+    PrinceAli: Boolean;         // Prince Ali Rescue done: the toll gate is free
+    State: EMinerState;
+    Rocks: array of TRock;
+    MineCenter: TPoint;         // map pixels (mean of the rocks found)
+    RockArea: TBox;             // map pixels: the box around all the rocks found
+    BankObj: TObject;
+    HasBank: Boolean;
+    Ores, Trips, Failures, Teleports: Integer;
+    SeenOres: Integer;          // wanted ores in the inventory when we last counted
+    WaitLogged: Boolean;        // "every rock is respawning" already said for this wait
+    PeekAt: Integer;            // which waiting rock to look at next
+    MiningLevel: Integer;
+    HavePick: Boolean;          // pickaxe in the inventory or worn (checked at start and at the bank)
+    HaveApron: Boolean;         // brown apron WORN (guild mines only; checked at start and at the bank)
+    FetchSwitched: Boolean;     // fetching a pickaxe/apron at the bank closest to us, not the mine's
+    SavedBankName: String;      // ...the mine's own bank, put back once we have them
+    SavedBankSpot: TPoint;
+    StopReason: String;
+  end;
+
+const
+  ANTIBAN_SLOWDOWN = 3;
+  EK_LADDER = 0;
+  EK_DOOR_STAIRS = 1;         // a door to open (if shut), then a staircase down/up
+  EK_SURFACE_DOOR = 2;        // a door on the way in and out (Crafting Guild), no stairs
+  ESS_MINE_NAME = 'Rune essence mine';   // picking this runs the rune essence routine
+
+var
+  // rock names in the game data, the word in their hover text, the ore item, level needed,
+  // and about how long one rock takes to respawn (ms)
+  ORE_ROCKS: TStringArray = ['Clay rocks', 'Copper rocks', 'Tin rocks', 'Iron rocks', 'Silver rocks',
+                             'Coal rocks', 'Gold rocks', 'Mithril rocks', 'Adamantite rocks'];
+  ORE_WORDS: TStringArray = ['Clay', 'Copper', 'Tin', 'Iron', 'Silver', 'Coal', 'Gold', 'Mithril', 'Adamant'];
+  ORE_ITEMS: TStringArray = ['Clay', 'Copper ore', 'Tin ore', 'Iron ore', 'Silver ore', 'Coal', 'Gold ore',
+                             'Mithril ore', 'Adamantite ore'];
+  ORE_LEVELS: TIntegerArray = [1, 1, 1, 15, 20, 30, 40, 55, 70];
+  ORE_RESPAWN: TIntegerArray = [1200, 2400, 2400, 5400, 60000, 30000, 60000, 120000, 240000];
+  // how long to keep swinging at one rock before trying another (ms). Mithril and adamant can
+  // take a long time to get an ore from; the bot only gives up early if the rock is mined out.
+  ORE_PATIENCE: TIntegerArray = [9000, 9000, 9000, 10000, 15000, 15000, 20000, 60000, 90000];
+
+  // pickaxes to take out of the bank, best first, with the Mining level each needs
+  BANK_PICKAXES: TStringArray = ['Rune pickaxe', 'Adamant pickaxe', 'Mithril pickaxe', 'Black pickaxe',
+                                 'Steel pickaxe', 'Iron pickaxe', 'Bronze pickaxe'];
+  BANK_PICKAXE_LEVELS: TIntegerArray = [41, 31, 21, 11, 6, 1, 1];
+
+  GEMS: TStringArray = ['Uncut sapphire', 'Uncut emerald', 'Uncut ruby', 'Uncut diamond'];
+
+  PICKAXES: TItemArray = [
+    'Bronze pickaxe', 'Iron pickaxe', 'Steel pickaxe', 'Black pickaxe', 'Mithril pickaxe',
+    'Adamant pickaxe', 'Rune pickaxe', 'Dragon pickaxe', 'Crystal pickaxe', 'Infernal pickaxe',
+    '3rd age pickaxe', 'Gilded pickaxe'
+  ];
+  // Mining level each of the PICKAXES above needs (same order)
+  PICKAXE_LEVELS: TIntegerArray = [1, 1, 6, 11, 21, 31, 41, 61, 71, 61, 61, 41];
+
+  MINES: array of TMineInfo;
+
+  // The F2P banks. A surface mine banks at whichever of these is the SHORTEST WALK away (from
+  // WaspLib's walking map), unless its bank is pinned (FixedBank: Lumbridge Swamp east, the
+  // Crafting Guild). Underground mines keep the bank named in the mine list.
+  // 'Lumbridge Castle' is on the top floor: its tile here is the ground-floor STAIRCASE (from
+  // your coordinate finder); the bot climbs with "Top-floor" and comes down with "Bottom-floor".
+  BANK_NAMES: TStringArray = ['Varrock East', 'Varrock West', 'Grand Exchange', 'Edgeville', 'Draynor',
+                              'Falador East', 'Falador West', 'Al Kharid', 'Lumbridge Castle'];
+  BANK_TILES: TPointArray = [[3253, 3421], [3185, 3437], [3164, 3488], [3094, 3492], [3092, 3243],
+                             [3013, 3356], [2946, 3368], [3270, 3167], [3206, 3209]];
+  LUMBRIDGE_STAIRS: TPoint = [12824, 37594];   // ground floor staircase = game (3206, 3209)
+  TOP_STAIRS: TPoint = [64032, 37590];         // top floor: where the stairs put you
+  TOP_BANK: TPoint = [64036, 37550];           // top floor: in front of the bank booths
+
+  // Lumbridge <-> Al Kharid toll gate (your coordinate finder: game (3267, 3227)). Prince Ali
+  // Rescue done: "Open" (just click it). Otherwise right-click "Pay-toll" (10 coins).
+  TOLL_GATE: TPoint = [13068, 37522];
+  TOLL_COINS = 10;
+  // where to stand on each side of the gate (from your walk): Lumbridge side / Al Kharid side
+  GATE_WEST: TPoint = [13060, 37522];   // game (3265, 3227)
+  GATE_EAST: TPoint = [13076, 37522];   // game (3269, 3227)
+
+  // The long way round when there are no coins and no Prince Ali Rescue (your walk, game
+  // tiles): north along the fence from the gate, round its north end, back south to the gate
+  // on the Al Kharid side. Walked backwards to leave Al Kharid.
+  LONG_WAY: TPointArray = [
+    [3265, 3227], [3260, 3236], [3259, 3246], [3252, 3254], [3251, 3264], [3246, 3273],
+    [3240, 3281], [3239, 3291], [3239, 3301], [3245, 3311], [3251, 3319], [3261, 3322],
+    [3269, 3329], [3279, 3330], [3275, 3319], [3275, 3309], [3275, 3299], [3269, 3291],
+    [3269, 3281], [3269, 3271], [3269, 3261], [3269, 3251], [3269, 3241], [3269, 3231],
+    [3269, 3227]
+  ];
+
+  // Dwarven Mine entrance (your coordinate finder, map pixels): a door, then the staircase down
+  // right next to it ("Open Door" / "Close Door" if already open; "Climb-down stair case";
+  // both plain left clicks). Coming back up: "Climb-up staircase" at DWARVEN_MINE_UP.
+  DWARVEN_MINE_DOOR: TPoint = [12244, 36934];      // game (3061, 3374)
+  DWARVEN_MINE_DOWN: TPoint = [12244, 36922];      // game (3061, 3377)
+  DWARVEN_MINE_UP: TPoint = [12232, 11322];        // game (3058, 9777)
+
+  // Crafting Guild door (your coordinate finder, map pixels): a left click on "Open Guild Door".
+  // Needs 40 Crafting AND a brown apron worn. The guild's own bank is members-only, so this mine
+  // banks at Falador East.
+  CRAFT_DOOR: TPoint = [11732, 37274];             // game (2933, 3289)
+  CRAFT_APRON = 'Brown apron';
+
+  // walker watchdog
+  WalkDeadline, WalkLogAt: UInt64;
+  // DEBUG (settings tick-box): level / quest / item checks only warn instead of stopping, so
+  // the walking and banking can be tested with any mine
+  DebugMode: Boolean;
+  WalkStallSpot: TPoint;        // where we were when we last moved a tile
+  WalkStallSince: UInt64;
+
+  HomeTeleReadyAt: UInt64;      // Home Teleport is on its 30 min cooldown until this time
+  WildernessHit: Boolean;       // we found ourselves in (or heading into) the Wilderness
+
+// ---------------------------------------------------------------- mine list
+
+// Game tile -> WaspLib map pixels (the same numbers the coordinate finder shows)
+function Tile(x, y: Integer): TPoint;
+begin
+  Result := Point(x * 4, 50430 - y * 4);
+end;
+
+// North of the Wilderness ditch (the F2P surface Wilderness, game y 3523 and up)? Map pixels.
+// Underground areas are far off this range, so they never count.
+function InWilderness(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 2940) and (gx <= 3400) and (gy >= 3523) and (gy <= 3970);
+end;
+
+procedure AddMine(name: String; cx, cy, bx, by, radius: Integer; ores: TStringArray; bankName, note: String);
+var
+  m: TMineInfo;
+begin
+  m.Name := name;
+  m.Center := Point(cx, cy);
+  m.BankSpot := Point(bx, by);
+  m.Radius := radius;
+  m.Ores := ores;
+  m.BankName := bankName;
+  m.Note := note;
+  MINES += m;
+end;
+
+// A ladder mine: Mining level needed, surface ladder spot and the spot it puts you on.
+procedure LastMineLadder(reqLevel: Integer; entrance, inside: TPoint);
+begin
+  MINES[High(MINES)].ReqLevel := reqLevel;
+  MINES[High(MINES)].Underground := True;
+  MINES[High(MINES)].EntranceKind := EK_LADDER;
+  MINES[High(MINES)].Entrance := entrance;
+  MINES[High(MINES)].Inside := inside;
+end;
+
+// A door+staircase mine (e.g. the Dwarven Mine): Mining level needed, the surface door, the
+// staircase next to it (going down), and where it puts you below (going up).
+procedure LastMineDoorStairs(reqLevel: Integer; doorSpot, downStairs, upStairs: TPoint);
+begin
+  MINES[High(MINES)].ReqLevel := reqLevel;
+  MINES[High(MINES)].Underground := True;
+  MINES[High(MINES)].EntranceKind := EK_DOOR_STAIRS;
+  MINES[High(MINES)].Door := doorSpot;
+  MINES[High(MINES)].Entrance := downStairs;
+  MINES[High(MINES)].Inside := upStairs;
+end;
+
+// A surface mine behind a guild door (Crafting Guild): Crafting level needed and the door.
+// Its bank is kept as given (no nearest-bank search: the walk goes through the door).
+procedure LastMineGuildDoor(reqCraft: Integer; doorSpot: TPoint);
+begin
+  MINES[High(MINES)].ReqCraft := reqCraft;
+  MINES[High(MINES)].EntranceKind := EK_SURFACE_DOOR;
+  MINES[High(MINES)].Door := doorSpot;
+  MINES[High(MINES)].FixedBank := True;
+end;
+
+// Centres are approximate: the bot looks up the real rocks near them in WaspLib's data.
+procedure SetupMines();
+begin
+  AddMine('South-east Varrock',     3287, 3366, 3253, 3421, 14, ['Copper', 'Tin', 'Iron'], 'Varrock East', '');
+  AddMine('South-west Varrock',     3180, 3371, 3185, 3437, 14, ['Clay', 'Tin', 'Iron', 'Silver'], 'Varrock West', '');
+  AddMine('Barbarian Village',      3081, 3421, 3094, 3492, 12, ['Tin', 'Coal'], 'Edgeville', '');
+  AddMine('Rimmington',             2977, 3240, 2946, 3368, 14, ['Clay', 'Copper', 'Tin', 'Iron', 'Gold'], 'Falador West', '');
+  AddMine('Lumbridge Swamp (east)', 3228, 3146, 3206, 3209, 12, ['Copper', 'Tin'], 'Lumbridge Castle',
+          'Banks upstairs in Lumbridge Castle.');
+  MINES[High(MINES)].FixedBank := True;     // always Lumbridge Castle (the closest), never re-picked
+  AddMine('Lumbridge Swamp (west)', 3147, 3150, 3092, 3243, 14, ['Coal', 'Mithril', 'Adamant'], 'Draynor', '');
+  AddMine('Al Kharid',              3299, 3300, 3270, 3167, 26, ['Copper', 'Tin', 'Iron', 'Silver', 'Coal', 'Gold', 'Mithril', 'Adamant'],
+          'Al Kharid', '');
+  MINES[High(MINES)].FixedBank := True;     // always the Al Kharid bank, never re-picked
+
+  // Mining Guild: down the ladder in Falador (your coordinates). The Allowed box below keeps the
+  // bot on the F2P side; the members' rocks next to it are never used.
+  AddMine('Mining Guild (F2P part)', 3037, 9740, 3013, 3356, 22,
+          ['Iron', 'Coal', 'Mithril', 'Adamant'], 'Falador East',
+          'Needs 60 Mining. The members side is visible but never mined.');
+  LastMineLadder(60, [12084, 37074], [12084, 11474]);
+  // only rocks inside this box are mined (your two corners, padded): keeps us on the F2P side
+  MINES[High(MINES)].Allowed := Box(3016, 9730, 3058, 9750);
+
+  // Dwarven Mine: door + staircase north-east of Falador. Rocks come from WaspLib's data; the
+  // centre/radius just pick out this mine. The box keeps us north of the Mining Guild.
+  // Ore list is a first guess: the first run's "Rocks: N x ..." log lines confirm it.
+  AddMine('Dwarven Mine',           3038, 9795, 3013, 3356, 32,
+          ['Clay', 'Copper', 'Tin', 'Iron', 'Coal', 'Gold', 'Mithril', 'Adamant'], 'Falador East',
+          'Underground: door + staircase north-east of Falador.');
+  LastMineDoorStairs(0, DWARVEN_MINE_DOOR, DWARVEN_MINE_DOWN, DWARVEN_MINE_UP);
+  MINES[High(MINES)].Allowed := Box(3000, 9758, 3072, 9840);
+
+  // Crafting Guild: 40 Crafting and a brown apron worn, through the guild door. The guild's own
+  // bank is members-only, so it banks at Falador East.
+  AddMine('Crafting Guild',         2936, 3282, 3013, 3356, 14,
+          ['Clay', 'Silver', 'Gold'], 'Falador East',
+          'Needs 40 Crafting and a brown apron WORN. The guild bank is members-only: banks at Falador East.');
+  LastMineGuildDoor(40, CRAFT_DOOR);
+  // inside the guild = south of the door (your test: the door takes you from y 3290 to 3289),
+  // so only rocks at y <= 3289 count; rocks out on the north side are left alone
+  // The same box is the bot's idea of "inside the guild": the door (2933, 3289) to the rocks
+  // (2938-2943, 3276-3288), with a little room round them.
+  MINES[High(MINES)].Allowed := Box(2928, 3272, 2946, 3289);
+
+  // Rune essence: its own routine (see RUNE ESSENCE below), not the normal mine loop. The
+  // numbers here are only for the list: Aubury's shop and Varrock East bank.
+  AddMine(ESS_MINE_NAME,            3253, 3402, 3253, 3421, 10,
+          ['Essence'], 'Varrock East',
+          'Needs Rune Mysteries. Aubury teleports you in, a portal brings you back, banks at Varrock East.');
+end;
+
+// ---------------------------------------------------------------- helpers
+
+// A window popped up that the script didn't open (a misclick on a poll booth, a notice board...):
+// close it with its X and carry on. The bank, deposit box, anvil and jewellery screens are left
+// alone. Uses WaspLib's general main-screen window check (MSInterface).
+var
+  StrayCheckAt: UInt64;
+
+function CloseStrayInterface(force: Boolean = False): Boolean;
+var
+  x: TBox;
+begin
+  if (not force) and (GetTimeRunning() < StrayCheckAt) then
+    Exit;
+  StrayCheckAt := GetTimeRunning() + 1500;
+  try
+    if Bank.IsOpen() or DepositBox.IsOpen() or Anvil.IsOpen() or GoldScreen.IsOpen() or SilverScreen.IsOpen() then
+      Exit;
+    if not MSInterface.IsOpen() then
+      Exit;
+    x := MSInterface.GetCloseButton();
+    if x = Default(TBox) then
+      Exit;
+    Logger.Warn('A window popped up (a misclick on a poll booth or similar) - closing it.');
+    Mouse.Click(x, EMouseButton.LEFT);
+    Result := SleepUntil(not MSInterface.IsOpen(), 100, 1500);
+  except
+  end;
+end;
+
+// An item left selected in the inventory (e.g. after a misclick) makes every click on the
+// game "Use item ->", and the bank / objects can't be opened. Unselect it.
+procedure UnselectItem();
+var
+  sel: Integer;
+begin
+  try
+    sel := Inventory.GetSelected();
+  except
+    Exit;
+  end;
+  if sel < 0 then
+    Exit;
+  Logger.Info('An item in the inventory was selected (slot ' + ToStr(sel + 1) + ') - unselecting it.');
+  Mouse.Click(Inventory.Slots.Box(sel), EMouseButton.LEFT);
+  SleepUntil(Inventory.GetSelected() < 0, 100, 1500);
+  Mouse.Move(Point(MainScreen.Bounds.Center.X + Random(-80, 80), MainScreen.Bounds.Center.Y + Random(-60, 60)));
+end;
+
+
+// Is this walk hopeless? Logged out (the walker would keep "walking" on the login screen), or
+// our position jumping tens of tiles back and forth (a bad reading, e.g. while logged out or
+// on a loading screen). Then the walk is stopped and the main loop logs back in / retries.
+var
+  SaneCheckAt: UInt64;
+  LastSanePos: TPoint;
+  PosJumps: Integer;
+
+function WalkLooksWrong(position: TPoint): Boolean;
+begin
+  if GetTimeRunning() >= SaneCheckAt then
+  begin
+    SaneCheckAt := GetTimeRunning() + 2000;
+    if not Client.IsLoggedIn() then
+    begin
+      Logger.Warn('Walk: we are logged out - stopping the walk (the script logs back in).');
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end;
+
+  if (position.X = 0) and (position.Y = 0) then
+    Exit;
+  if (LastSanePos.X <> 0) and (position.DistanceTo(LastSanePos) > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Inc(PosJumps);
+    if PosJumps >= 4 then
+    begin
+      Logger.Warn('Walk: our position keeps jumping around (now [' + ToStr(position.X) + ', ' +
+                  ToStr(position.Y) + ']) - the reading is off, stopping this walk.');
+      PosJumps := 0;
+      LastSanePos := Point(0, 0);
+      Exit(True);
+    end;
+  end
+  else
+    PosJumps := 0;
+  LastSanePos := position;
+end;
+
+procedure TWalker.Watchdog(walker: PRSWalker; position, destination: TPoint);
+begin
+  CloseStrayInterface();
+  if WalkLooksWrong(position) then
+  begin
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+  // never into the Wilderness: stop the walk the moment we're in it or it's heading there
+  // (a destination hundreds of tiles away is a bad point from WaspLib's walker, e.g. on a
+  // floor it has no path for, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if (WalkDeadline > 0) and (GetTimeRunning() > WalkDeadline) then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  // stuck against a fence/wall WaspLib thinks isn't there: not moved a tile in 8 s -> stop
+  if WalkDeadline > 0 then
+  begin
+    if position.DistanceTo(WalkStallSpot) >= RSTranslator.TILE_SIZE then
+    begin
+      WalkStallSpot := position;
+      WalkStallSince := GetTimeRunning();
+    end
+    else if GetTimeRunning() - WalkStallSince > 8000 then
+    begin
+      Logger.Warn('Walk: not moved for 8 s at [' + ToStr(position.X) + ', ' + ToStr(position.Y) +
+                  '] (stuck on something), stopping this walk.');
+      walker^.Walking := False;
+      WalkDeadline := 0;
+    end;
+  end;
+end;
+
+// WaspLib's walker with a time limit. True when we end within `reachTiles` of `dest`.
+function SafeWebWalk(dest: TPoint; ms, reachTiles: Integer): Boolean;
+var
+  path, dense: TPointArray;
+  i, k, steps: Integer;
+begin
+  CloseStrayInterface(True);   // a window left open (misclick) blocks the walk
+  if InWilderness(dest) then
+  begin
+    Logger.Error('Walk: refusing to walk into the Wilderness.');
+    WildernessHit := True;
+    Exit(False);
+  end;
+
+  WalkStallSpot := Map.Position();
+  WalkStallSince := GetTimeRunning();
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    // WaspLib's route can have points 90+ tiles apart (e.g. south of Varrock). The minimap only
+    // reaches ~15 tiles, so the walker freezes on such a step. Fill in a point every 10 tiles,
+    // then walk that.
+    path := Map.Walker.GetPath(Map.Position(), dest, 0.3);
+    for i := 0 to High(path) do
+    begin
+      if i > 0 then
+      begin
+        steps := Ceil(path[i - 1].DistanceTo(path[i]) / (10 * RSTranslator.TILE_SIZE));
+        for k := 1 to steps - 1 do
+          dense += Point(path[i - 1].X + (path[i].X - path[i - 1].X) * k div steps,
+                         path[i - 1].Y + (path[i].Y - path[i - 1].Y) * k div steps);
+      end;
+      dense += path[i];
+    end;
+    if dense <> [] then
+      Map.Walker.WalkPath(dense, 8)
+    else
+      Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+  end;
+  WalkDeadline := 0;
+  Result := Map.Position().DistanceTo(dest) <= reachTiles * RSTranslator.TILE_SIZE;
+end;
+
+// Hovers points around `center` in growing rings until the hover text contains one of
+// `texts`. Leaves the mouse there (does NOT click).
+function HoverFind(center: TPoint; texts: TStringArray; radius, step: Integer): Boolean;
+var
+  r, k, n: Integer;
+  pt: TPoint;
+  a: Double;
+begin
+  r := 0;
+  while r <= radius do
+  begin
+    if r = 0 then
+      n := 1
+    else
+      n := Max(6, Round(2 * PI * r / step));
+
+    for k := 0 to n - 1 do
+    begin
+      a := 2 * PI * k / n;
+      pt := Point(center.X + Round(r * Cos(a)) + Random(-2, 2), center.Y + Round(r * Sin(a)) + Random(-2, 2));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(texts, True, 0.85, 60) then
+        Exit(True);
+    end;
+    r += step;
+  end;
+end;
+
+// Minimap click `tiles` tiles away in a world direction (dx east, dy north = -1...), whatever
+// way the camera faces. Works where WaspLib's map can't place us (Lumbridge top floor).
+procedure StepDirection(dx, dy, tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-2, 2), mm.Y + Random(-2, 2)), EMouseButton.LEFT);
+  Sleep(600, 900);
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 8000);
+end;
+
+// The object called one of `names` that WaspLib knows closest to `spot` (within maxTiles).
+function NearestObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bj := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+        end;
+      end;
+  end;
+
+  if (bj = -1) or (best > maxTiles * RSTranslator.TILE_SIZE) then
+    Exit(False);
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Logger.Info('WaspLib object: "' + single.Name + '" at [' + ToStr(single.Coordinates[0].X) + ', ' +
+              ToStr(single.Coordinates[0].Y) + '].');
+  Result := True;
+end;
+
+// Use the staircase WaspLib knows next to `spot` with one of `options` ("Top-floor" /
+// "Bottom-floor"). No searching the screen.
+function UseStaircase(spot: TPoint; options: TStringArray): Boolean;
+var
+  stairs: TObject;
+  opt, pick: TOption;
+  menu, t: String;
+  hovered, found, goingDown: Boolean;
+begin
+  goingDown := Pos('ottom', options[0]) > 0;
+  if not NearestObject(['Staircase'], spot, 6, stairs) then
+  begin
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+    Exit;
+  end;
+
+  // put the mouse on WaspLib's staircase, then right-click and choose the option ourselves
+  // we're standing next to it: hover it where it is first, only walk if that fails
+  try
+    hovered := stairs.Hover([]);
+    if not hovered then
+      hovered := stairs.WalkHover([]);
+  except
+    Logger.Warn('Stairs: ' + GetExceptionMessage());
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Stairs: could not hover the staircase.');
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Stairs: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+
+  // The menu reader garbles letters ("Too-floor", "Climb-uo"), so don't match the exact
+  // words: "Top-floor" = any line with "floor" that isn't "Bottom"; "Bottom-floor" = a line
+  // with "ottom"/"Bott".
+  found := False;
+  for opt in ChooseOption.GetOptions() do
+  begin
+    menu += '[' + opt.Text + '] ';
+    if found then
+      Continue;
+    t := Lowercase(opt.Text);
+    if Pos('floor', t) = 0 then
+      Continue;
+    if goingDown = ((Pos('ottom', t) > 0) or (Pos('bott', t) > 0)) then
+    begin
+      pick := opt;
+      found := True;
+    end;
+  end;
+
+  if found then
+  begin
+    ChooseOption.Select(pick);    // (selecting a TOption returns nothing)
+    Result := True;
+  end;
+  if not Result then
+  begin
+    Logger.Warn('Stairs: no ' + options[0] + ' option. The menu says: ' + menu);
+    if ChooseOption.IsOpen() then
+      ChooseOption.Close();
+    Exit;
+  end;
+  Logger.Info('Stairs: clicked ' + options[0] + '.');
+  Sleep(2500, 3500);
+end;
+
+// Which floor are we on? Upper floors sit to the right on WaspLib's map.
+function CurrentFloor(): Integer;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(-1);
+  Result := me.X div RSTranslator.MapWidth;
+end;
+
+procedure CancelMenu();
+begin
+  if not ChooseOption.IsOpen() then
+    Exit;
+  if not ChooseOption.Select(['Cancel', 'ancel']) then
+    ChooseOption.Close();
+  Sleep(80, 200);
+end;
+
+procedure SlowAntiban();
+var
+  i: Integer;
+begin
+  for i := 0 to High(Antiban.Tasks) do
+  begin
+    Antiban.Tasks[i].Interval := Antiban.Tasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.Tasks[i].Countdown.Start(Round(Antiban.Tasks[i].Interval * Random(60, 100) / 100));
+  end;
+  for i := 0 to High(Antiban.WalkTasks) do
+  begin
+    Antiban.WalkTasks[i].Interval := Antiban.WalkTasks[i].Interval * ANTIBAN_SLOWDOWN;
+    Antiban.WalkTasks[i].Countdown.Start(Round(Antiban.WalkTasks[i].Interval * Random(60, 100) / 100));
+  end;
+end;
+
+// The apron has to be WORN to get through the guild door, so the inventory doesn't count.
+function WearingApron(): Boolean;
+begin
+  if Equipment.Open() then
+    Result := Equipment.Items.Count(CRAFT_APRON) > 0;
+  Inventory.Open();
+end;
+
+// A pickaxe in the inventory that a level `level` miner can use (0 = level unknown: any counts).
+// Inventory only, so it also works with the bank open.
+function CarriesUsablePickaxe(level: Integer): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(PICKAXES) do
+    if ((level = 0) or (level >= PICKAXE_LEVELS[i])) and (Inventory.Items.Count(PICKAXES[i]) > 0) then
+      Exit(True);
+end;
+
+// A pickaxe we can use, in the inventory or worn. One we're too low a level for doesn't
+// count (it's logged), so the bot fetches a usable one from the bank instead.
+function HasPickaxe(level: Integer): Boolean;
+var
+  i: Integer;
+begin
+  if CarriesUsablePickaxe(level) then
+    Exit(True);
+
+  for i := 0 to High(PICKAXES) do
+    if Inventory.Items.Count(PICKAXES[i]) > 0 then
+      Logger.Warn('Pickaxe: ' + PICKAXES[i] + ' needs ' + ToStr(PICKAXE_LEVELS[i]) +
+                  ' Mining (you have ' + ToStr(level) + ') - can''t use it.');
+
+  if Equipment.Open() then
+    for i := 0 to High(PICKAXES) do
+      if Equipment.Items.Count(PICKAXES[i]) > 0 then
+      begin
+        if (level = 0) or (level >= PICKAXE_LEVELS[i]) then
+        begin
+          Inventory.Open();
+          Exit(True);
+        end;
+        Logger.Warn('Pickaxe: the worn ' + PICKAXES[i] + ' needs ' + ToStr(PICKAXE_LEVELS[i]) +
+                    ' Mining (you have ' + ToStr(level) + ') - can''t use it.');
+      end;
+  Inventory.Open();
+end;
+
+function Here(): String;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := '[' + ToStr(me.X) + ', ' + ToStr(me.Y) + ']';
+end;
+
+// ---------------------------------------------------------------- setup
+
+function TMiner.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Self.Mine.Name,
+    ToStr(Self.Ores),
+    FormatNumber(Self.Ores / Logger.TimeRunning.Elapsed * HOUR),
+    ToStr(Self.Trips),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+// Can we walk from the mine's centre to this rock without a detour? A rock behind a wall or a
+// door (e.g. the members side of the Mining Guild, which you can see but not reach) is either
+// not connected at all in WaspLib's walking graph, or only by a long way round.
+function RockReachable(from, rock: TPoint): Boolean;
+var
+  path: TPointArray;
+  i: Integer;
+  len: Double;
+begin
+  try
+    path := Map.Walker.Graph^.PathBetween(from, rock, 0, 2);
+  except
+    Exit(False);
+  end;
+
+  for i := 1 to High(path) do
+    len += path[i].DistanceTo(path[i - 1]);
+  Result := len <= from.DistanceTo(rock) * 2 + 15 * RSTranslator.TILE_SIZE;
+end;
+
+// Inside the mine's allowed box (if it has one)?
+function InAllowed(m: TMineInfo; spot: TPoint): Boolean;
+var
+  a, b: TPoint;
+begin
+  if (m.Allowed.X1 = 0) and (m.Allowed.X2 = 0) then
+    Exit(True);
+  a := Tile(m.Allowed.X1, m.Allowed.Y1);
+  b := Tile(m.Allowed.X2, m.Allowed.Y2);
+  Result := (spot.X >= Min(a.X, b.X)) and (spot.X <= Max(a.X, b.X)) and
+            (spot.Y >= Min(a.Y, b.Y)) and (spot.Y <= Max(a.Y, b.Y));
+end;
+
+// Every wanted rock near the mine, each as its own object.
+procedure TMiner.FindRocks();
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  center: TPoint;
+  i, j, o, n, skipped: Integer;
+  r: TRock;
+  sum: TPoint;
+begin
+  center := Tile(Self.Mine.Center.X, Self.Mine.Center.Y);
+
+  for o := 0 to High(ORE_ROCKS) do
+  begin
+    if not Self.Want[o] then
+      Continue;
+
+    try
+      all := MapObjects.GetByName(ORE_ROCKS[o]);
+    except
+      all := [];
+    end;
+
+    n := 0;
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        if all[i].Coordinates[j].DistanceTo(center) > Self.Mine.Radius * RSTranslator.TILE_SIZE then
+          Continue;
+
+        // members-only / unreachable rocks: never even considered
+        if not InAllowed(Self.Mine, all[i].Coordinates[j]) then
+        begin
+          Inc(skipped);
+          Continue;
+        end;
+        if not RockReachable(center, all[i].Coordinates[j]) then
+        begin
+          Inc(skipped);
+          Continue;
+        end;
+
+        single := all[i];
+        single.Coordinates := [all[i].Coordinates[j]];
+        if j <= High(all[i].Rotations) then
+          single.Rotations := [all[i].Rotations[j]];
+
+        r.Obj := TObject.Create(Map.Walker, single);
+        r.Spot := all[i].Coordinates[j];
+        r.Ore := o;
+        r.FreeAt := 0;
+        Self.Rocks += r;
+        sum.X += r.Spot.X;
+        sum.Y += r.Spot.Y;
+        Inc(n);
+      end;
+
+    Logger.Info('Rocks: ' + ToStr(n) + ' x ' + ORE_ROCKS[o] + ' at ' + Self.Mine.Name + '.');
+    if skipped > 0 then
+      Logger.Info('Rocks: ignored ' + ToStr(skipped) + ' that are out of bounds or can''t be walked to (members side / behind a wall).');
+    skipped := 0;
+  end;
+
+  if Self.Rocks = [] then
+    Exit;
+
+  // the real middle of the rocks we'll mine, and the box around them
+  Self.MineCenter := Point(sum.X div Length(Self.Rocks), sum.Y div Length(Self.Rocks));
+  Self.RockArea := Box(Self.Rocks[0].Spot.X, Self.Rocks[0].Spot.Y, Self.Rocks[0].Spot.X, Self.Rocks[0].Spot.Y);
+  for i := 1 to High(Self.Rocks) do
+  begin
+    Self.RockArea.X1 := Min(Self.RockArea.X1, Self.Rocks[i].Spot.X);
+    Self.RockArea.Y1 := Min(Self.RockArea.Y1, Self.Rocks[i].Spot.Y);
+    Self.RockArea.X2 := Max(Self.RockArea.X2, Self.Rocks[i].Spot.X);
+    Self.RockArea.Y2 := Max(Self.RockArea.Y2, Self.Rocks[i].Spot.Y);
+  end;
+  Logger.Info('Rocks: ' + ToStr(Length(Self.Rocks)) + ' in all, between game tiles (' +
+              ToStr(Self.RockArea.X1 div 4) + ', ' + ToStr((50430 - Self.RockArea.Y2) div 4) + ') and (' +
+              ToStr(Self.RockArea.X2 div 4) + ', ' + ToStr((50430 - Self.RockArea.Y1) div 4) + '), middle (' +
+              ToStr(Self.MineCenter.X div 4) + ', ' + ToStr((50430 - Self.MineCenter.Y) div 4) + ').');
+end;
+
+// Walking distance (tiles) on WaspLib's walking map, or -1 if WaspLib can't connect them.
+function WalkTiles(a, b: TPoint): Integer;
+var
+  path: TPointArray;
+  i: Integer;
+  len: Double;
+begin
+  try
+    path := Map.Walker.Graph^.PathBetween(a, b, 0, 2);
+  except
+    Exit(-1);
+  end;
+  for i := 1 to High(path) do
+    len += path[i].DistanceTo(path[i - 1]);
+  Result := Round(len / RSTranslator.TILE_SIZE);
+end;
+
+// Pick the bank with the shortest walk from the mine. Banks WaspLib can't connect to the mine
+// (stairs, toll gate, walls) are skipped automatically.
+procedure TMiner.ChooseBank();
+var
+  i, d, best: Integer;
+  from: TPoint;
+  report: String;
+begin
+  from := Self.MineCenter;
+  best := -1;
+  for i := 0 to High(BANK_NAMES) do
+  begin
+    // only look at banks within ~250 tiles in a straight line
+    if from.DistanceTo(Tile(BANK_TILES[i].X, BANK_TILES[i].Y)) > 250 * RSTranslator.TILE_SIZE then
+      Continue;
+
+    d := WalkTiles(from, Tile(BANK_TILES[i].X, BANK_TILES[i].Y));
+    if d < 0 then
+    begin
+      report += BANK_NAMES[i] + ': no walk. ';
+      Continue;
+    end;
+    report += BANK_NAMES[i] + ': ' + ToStr(d) + ' tiles. ';
+    if (best = -1) or (d < best) then
+    begin
+      best := d;
+      Self.Mine.BankName := BANK_NAMES[i];
+      Self.Mine.BankSpot := BANK_TILES[i];
+    end;
+  end;
+
+  Logger.Info('Bank: walks from ' + Self.Mine.Name + ' - ' + report);
+  if best = -1 then
+    Logger.Warn('Bank: WaspLib can''t walk from this mine to any bank; trying ' + Self.Mine.BankName + ' anyway.')
+  else
+    Logger.Info('Bank: using ' + Self.Mine.BankName + ' (' + ToStr(best) + ' tiles).');
+end;
+
+// The bank booth / chest / banker WaspLib knows that is closest to this mine's bank.
+procedure TMiner.FindBank();
+var
+  spot: TPoint;
+  names: TStringArray;
+  name: String;
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  i, j, bi, bj: Integer;
+  best, d: Double;
+begin
+  names := ['Bank booth', 'Bank chest', 'Bank Booth'];
+  spot := Tile(Self.Mine.BankSpot.X, Self.Mine.BankSpot.Y);
+  best := 1000000000;
+  bi := -1;
+
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          single := all[i];
+          bj := j;
+          bi := i;
+        end;
+      end;
+  end;
+
+  if (bi = -1) or (best > 25 * RSTranslator.TILE_SIZE) then
+  begin
+    Logger.Warn('Bank: WaspLib has no bank booth near ' + Self.Mine.BankName + '. Will use WaspLib''s nearest bank.');
+    Exit;
+  end;
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  Self.BankObj := TObject.Create(Map.Walker, single);
+  Self.HasBank := True;
+  Logger.Info('Bank: ' + Self.Mine.BankName + ' booth at [' + ToStr(single.Coordinates[0].X) + ', ' +
+              ToStr(single.Coordinates[0].Y) + '].');
+end;
+
+function TMiner.InsideGuild(): Boolean; forward;
+
+procedure TMiner.Init();
+var
+  lvl, o, wanted: Integer;
+begin
+  Self.LastOre := -1;
+  Self.SeenOres := -1;
+  Logger.Setup('DMB''s F2P Miner');
+  ProgressReport.Setup(
+    'DMB''s F2P Miner',
+    ['Script runtime:', 'Mine:', 'Ores mined:', 'Ores/H:', 'Bank trips:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+  StartListeners(300);
+
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  // LEVELS are checked now; ITEMS (the pickaxe) are checked at the bank, where a missing
+  // one can be taken out.
+  lvl := Stats.GetLevel(ESkill.MINING, False);
+  Self.MiningLevel := lvl;
+  Inventory.Open();
+  if Self.PowerMine then
+    Logger.Info('Mining level: ' + ToStr(lvl) + '. Mine: ' + Self.Mine.Name + '. Power mining (dropping).')
+  else
+    Logger.Info('Mining level: ' + ToStr(lvl) + '. Mine: ' + Self.Mine.Name + '. Banking at ' + Self.Mine.BankName + '.');
+  if Self.Mine.Note <> '' then
+    Logger.Info('Note: ' + Self.Mine.Note);
+
+  for o := 0 to High(ORE_ROCKS) do
+    if Self.Want[o] and (lvl > 0) and (lvl < ORE_LEVELS[o]) then
+    begin
+      if DebugMode then
+        Logger.Warn('DEBUG: ' + ORE_WORDS[o] + ' needs ' + ToStr(ORE_LEVELS[o]) + ' Mining (you have ' + ToStr(lvl) + ') - keeping it anyway.')
+      else
+      begin
+        Logger.Warn(ORE_WORDS[o] + ' needs ' + ToStr(ORE_LEVELS[o]) + ' Mining (you have ' + ToStr(lvl) + '). Skipping it.');
+        Self.Want[o] := False;
+      end;
+    end;
+
+  for o := 0 to High(ORE_ROCKS) do
+    if Self.Want[o] then
+      Inc(wanted);
+  if wanted = 0 then
+    raise 'None of the chosen ores can be mined (level too low, or none ticked).';
+
+  // The F2P surface (Falador to Al Kharid, Draynor to Edgeville) + the top floor of Lumbridge
+  // Castle (its bank), plus the underground area (Dwarven Mine / Mining Guild) when needed.
+  Logger.Info('Map: loading the areas (this can take a moment the first time).');
+  if Self.Mine.Underground then
+    Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2), Chunk(Box(46, 154, 47, 151), 0)])
+  else
+    Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(50, 50, 50, 50), 2)]);
+  Map.Walker.OnWalkEvent := @Map.Walker.Watchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.Watchdog;
+  // minimap clicks only: a game-screen click next to the Lumbridge stairs can land on the
+  // staircase and "Climb-down" one floor by accident
+  Map.Walker.ScreenWalk := False;
+
+  Self.FindRocks();
+  if Self.Rocks = [] then
+    raise 'WaspLib has none of the chosen rocks at ' + Self.Mine.Name + '. Pick other ores for this mine.';
+  if not Self.PowerMine then
+  begin
+    // an underground mine keeps its own bank (no walk connects them: you use the ladder), and so
+    // does a guild mine (the walk out goes through a door WaspLib can't open)
+    if (not Self.Mine.Underground) and (not Self.Mine.FixedBank) then
+      Self.ChooseBank();
+    Self.FindBank();
+  end;
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.MINING, ESkill.TOTAL];
+  SlowAntiban();
+
+  Self.HavePick := HasPickaxe(Self.MiningLevel);
+  if Self.HavePick then
+    Logger.Info('Pickaxe: found.')
+  else
+    Logger.Info('Pickaxe: none you can use in the inventory or worn - will take one out at the closest bank first.');
+
+  // guild mines: the Crafting level is checked now, the apron at the bank
+  if Self.Mine.ReqCraft > 0 then
+  begin
+    lvl := Stats.GetLevel(ESkill.CRAFTING, False);
+    if (lvl > 0) and (lvl < Self.Mine.ReqCraft) then
+    begin
+      if not DebugMode then
+        raise Self.Mine.Name + ' needs ' + ToStr(Self.Mine.ReqCraft) + ' Crafting (you have ' + ToStr(lvl) + ').';
+      Logger.Warn('DEBUG: ' + Self.Mine.Name + ' needs ' + ToStr(Self.Mine.ReqCraft) + ' Crafting (you have ' + ToStr(lvl) + ') - carrying on.');
+    end;
+    Self.HaveApron := WearingApron();
+    if Self.InsideGuild() then
+      Logger.Info('Guild: we start INSIDE the ' + Self.Mine.Name + '.')
+    else
+      Logger.Info('Guild: we start OUTSIDE the ' + Self.Mine.Name + '.');
+    if Self.HaveApron then
+      Logger.Info('Apron: a ' + CRAFT_APRON + ' is on.')
+    else
+      Logger.Info('Apron: none on - will take one out at the closest bank and wear it.');
+  end;
+
+  Logger.Info('Start: we are at ' + Here() + ', ' +
+              ToStr(Round(Map.Position().DistanceTo(Self.MineCenter) / RSTranslator.TILE_SIZE)) + ' tiles from the mine.');
+end;
+
+// ---------------------------------------------------------------- travel
+
+// How far `p` is from the line segment a-b (map pixels).
+function SegmentDistance(p, a, b: TPoint): Double;
+var
+  dx, dy, t: Double;
+begin
+  dx := b.X - a.X;
+  dy := b.Y - a.Y;
+  if (dx = 0) and (dy = 0) then
+    Exit(p.DistanceTo(a));
+  t := ((p.X - a.X) * dx + (p.Y - a.Y) * dy) / (dx * dx + dy * dy);
+  t := Max(0, Min(1, t));
+  Result := Sqrt(Sqr(p.X - (a.X + t * dx)) + Sqr(p.Y - (a.Y + t * dy)));
+end;
+
+// Guild mines: are we inside the guild? WaspLib's walker treats the inside as cut off (the
+// door is a wall to it), so we can't ask it - the mine's Allowed box is the inside of the guild
+// instead (from your test: the door takes you south from y 3290 to 3289).
+function TMiner.InsideGuild(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(False);
+  Result := InAllowed(Self.Mine, me);
+end;
+
+function TMiner.AtMine(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := me.DistanceTo(Self.MineCenter) <= (Self.Mine.Radius + 4) * RSTranslator.TILE_SIZE;
+  // behind a guild door: near the rocks isn't enough, we have to be on their side of the wall
+  if Result and (Self.Mine.EntranceKind = EK_SURFACE_DOOR) then
+    Result := Self.InsideGuild();
+end;
+
+// Home Teleport to Lumbridge (free, 30 min cooldown).
+// Something attacking us? An HP bar shows above the player (the middle of the game screen)
+// while in combat.
+function InCombat(): Boolean;
+var
+  bars: THPBarArray;
+  bar: THPBar;
+  c: TPoint;
+begin
+  c := MainScreen.Bounds.Center;
+  try
+    if not THPBar.Find(bars) then
+      Exit(False);
+  except
+    Exit(False);
+  end;
+  for bar in bars do
+    if (Abs(bar.Bounds.Center.X - c.X) < 60) and (bar.Bounds.Center.Y < c.Y + 10) and
+       (c.Y - bar.Bounds.Center.Y < 110) then
+      Exit(True);
+end;
+
+// Get away from whatever is attacking us: run ~12 tiles in a random direction, a few times.
+function RunFromCombat(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InCombat() then
+      Exit(True);
+    Logger.Info('Travel: something is attacking us - running away (' + ToStr(i) + ').');
+    if not Minimap.EnergyEnabled() then
+      Minimap.EnableEnergy();          // run on
+    case Random(4) of
+      0: StepDirection(1, 0, 12);
+      1: StepDirection(-1, 0, 12);
+      2: StepDirection(0, 1, 12);
+      3: StepDirection(0, -1, 12);
+    end;
+    Sleep(3000, 5000);             // out of combat after a few seconds away
+  end;
+  Result := not InCombat();
+end;
+
+// Home Teleport to Lumbridge (free). Has a 30 min cooldown and stops if we're attacked:
+// - cooldown: we remember when it was last used; if it fails for no visible reason we
+//   assume a cooldown we didn't know about and leave it 5 min before trying again
+// - combat: run away first, and if a hit interrupts the cast, run and try once more
+function TMiner.HomeTeleport(): Boolean;
+var
+  before: TPoint;
+  attempt: Integer;
+  wasHit: Boolean;
+  deadline: UInt64;
+begin
+  if GetTimeRunning() < HomeTeleReadyAt then
+  begin
+    Logger.Warn('Travel: Home Teleport is on cooldown for about ' +
+                ToStr((HomeTeleReadyAt - GetTimeRunning()) div 60000 + 1) + ' more min.');
+    Exit;
+  end;
+
+  for attempt := 1 to 2 do
+  begin
+    if InCombat() and not RunFromCombat() then
+    begin
+      Logger.Warn('Travel: can''t get out of combat to teleport.');
+      Exit;
+    end;
+
+    Logger.Info('Travel: casting Home Teleport to Lumbridge.');
+    before := Map.Position();
+    try
+      if not Magic.Cast(ESpell.LUMBRIDGE_HOME_TELEPORT) then
+      begin
+        Logger.Warn('Travel: could not click Home Teleport.');
+        Inventory.Open();
+        Exit;
+      end;
+    except
+      Logger.Warn('Travel: Home Teleport failed: ' + GetExceptionMessage());
+      Inventory.Open();
+      Exit;
+    end;
+
+    // the cast takes ~10 s; watch for being hit while it runs
+    wasHit := False;
+    deadline := GetTimeRunning() + 25000;
+    repeat
+      Sleep(500);
+      Result := Map.Position().DistanceTo(before) > 30 * RSTranslator.TILE_SIZE;
+      if (not Result) and InCombat() then
+        wasHit := True;
+    until Result or wasHit or (GetTimeRunning() > deadline);
+    Inventory.Open();
+
+    if Result then
+    begin
+      Inc(Self.Teleports);
+      HomeTeleReadyAt := GetTimeRunning() + 30 * 60000;
+      Logger.Info('Travel: teleported, now at ' + Here() + '.');
+      Exit;
+    end;
+
+    if wasHit then
+    begin
+      Logger.Warn('Travel: the teleport was interrupted by an attack.');
+      Continue;                      // run away and cast again
+    end;
+
+    // not hit, didn't go: most likely the cooldown from before the script started
+    Logger.Warn('Travel: the teleport did not happen - probably still on cooldown. Trying again in 5 min.');
+    HomeTeleReadyAt := GetTimeRunning() + 5 * 60000;
+    Exit;
+  end;
+end;
+
+// Lumbridge Castle bank (tested with test_lumbridge_bank): WaspLib walks us to the ground-floor
+// staircase, its "Top-floor" option, then WaspLib's bank booth on the top floor.
+function TMiner.OpenLumbridgeBank(): Boolean;
+var
+  booth: TObject;
+begin
+  if CurrentFloor() <> 2 then
+  begin
+    Logger.Info('Bank: to the Lumbridge Castle staircase.');
+    if not SafeWebWalk(LUMBRIDGE_STAIRS, 180000, 3) then
+    begin
+      Logger.Warn('Bank: did not reach the staircase (we are at ' + Here() + ').');
+      Exit;
+    end;
+    Map.Walker.WaitMoving();
+
+    Logger.Info('Bank: climbing to the top floor.');
+    if not UseStaircase(LUMBRIDGE_STAIRS, ['Top-floor', 'op-floor', 'Top floor']) then
+      Exit;
+    if not SleepUntil(CurrentFloor() = 2, 300, 5000) then
+      Logger.Warn('Bank: not on the top floor after climbing? We are at ' + Here() + '.');
+  end;
+
+  Logger.Info('Bank: opening the top-floor bank booth.');
+  if NearestObject(['Bank booth', 'Bank Booth'], TOP_BANK, 8, booth) then
+  begin
+    WalkStallSpot := Map.Position();
+    WalkStallSince := GetTimeRunning();
+    WalkDeadline := GetTimeRunning() + 45000;
+    try
+      if Bank.Open(booth, True) then
+      begin
+        WalkDeadline := 0;
+        Exit(True);
+      end;
+    except
+      Logger.Warn('Bank: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+  end;
+
+  // backup: walk to the booths and find one by its hover text
+  if not SafeWebWalk(TOP_BANK, 30000, 2) then
+    StepDirection(0, -1, 10);
+  if not HoverFind(MainScreen.Bounds.Center, ['Bank Bank booth', 'Bank booth', 'Bank Banker', 'ank booth'], 300, 16) then
+  begin
+    Logger.Warn('Bank: no bank booth found on the top floor.');
+    Exit;
+  end;
+  Mouse.Click(EMouseButton.LEFT);
+  Result := SleepUntil(Bank.IsOpen(), 100, 8000);
+end;
+
+// Back down from the Lumbridge Castle top floor: WaspLib's walker to the stairs, then its
+// staircase with "Bottom-floor".
+function TMiner.LeaveTopFloor(): Boolean;
+begin
+  Logger.Info('Travel: down the Lumbridge Castle stairs.');
+  if not SafeWebWalk(TOP_STAIRS, 30000, 2) then
+    StepDirection(0, 1, 9);
+  Result := UseStaircase(TOP_STAIRS, ['Bottom-floor', 'ottom-floor', 'Bottom floor']) and
+            SleepUntil(CurrentFloor() = 0, 300, 5000);
+  if Result then
+    Logger.Info('Travel: back on the ground floor at ' + Here() + '.');
+end;
+
+// Is this spot inside Al Kharid (east of the Lumbridge fence)?
+function InAlKharid(p: TPoint): Boolean;
+var
+  gx, gy: Integer;
+begin
+  if (p.X = 0) and (p.Y = 0) then
+    Exit(False);
+  gx := p.X div 4;
+  gy := (50430 - p.Y) div 4;
+  Result := (gx >= 3268) and (gy >= 3130) and (gy <= 3330);
+end;
+
+// Coins in the inventory: the size of the stack (Count would only count inventory slots, so
+// any stack of coins read as 1). Reads up to 3 times in case the number is still drawing.
+function CoinCount(): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    Result := Max(Result, Inventory.Items.CountEx('Coins'));
+    if Result >= TOLL_COINS then
+      Break;
+    Sleep(300, 500);
+  end;
+end;
+
+// Right-click the gate and pick the first menu line containing one of `wanted`. `menu` gets the
+// whole menu (for the log). False = none of them was there (the menu is closed again).
+function GateMenu(gate: TObject; wanted: TStringArray; out menu: String): Boolean;
+var
+  opt, pick: TOption;
+  w: String;
+  hovered, found: Boolean;
+  tries: Integer;
+begin
+  menu := '';
+  // a few tries; between them turn the camera a quarter turn, in case the gate is hidden
+  // behind something or seen edge-on
+  for tries := 1 to 4 do
+  begin
+    try
+      hovered := gate.Hover([]);
+    except
+      Logger.Warn('Gate: ' + GetExceptionMessage());
+    end;
+    if hovered then
+      Break;
+    if tries < 4 then
+    begin
+      Logger.Info('Gate: can''t hover it from this angle - turning the camera.');
+      Minimap.CompassDegrees := Round(Minimap.CompassDegrees + 90 + Random(-15, 15)) mod 360;
+      Sleep(600, 1000);
+    end;
+  end;
+  if not hovered then
+  begin
+    Logger.Warn('Gate: could not hover the gate (tried 4 camera angles).');
+    Exit;
+  end;
+
+  Logger.Info('Gate: hovering it, hover text: "' + MainScreen.UpText + '".');
+
+  // the hover text is read reliably ("Open Gate"); the right-click menu reader garbles letters
+  // ("Ooen Gate"). So when the left-click option is already the one we want, just left-click.
+  for w in wanted do
+    if MainScreen.IsUpText([w], False, 0.85, 50) then
+    begin
+      Logger.Info('Gate: left-clicking it ("' + MainScreen.UpText + '").');
+      Mouse.Click(EMouseButton.LEFT);
+      Exit(True);
+    end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1500) then
+  begin
+    Logger.Warn('Gate: the right-click menu did not open.');
+    Exit;
+  end;
+  Sleep(150, 350);
+  for opt in ChooseOption.GetOptions() do
+    menu += '[' + opt.Text + '] ';
+  for w in wanted do
+  begin
+    for opt in ChooseOption.GetOptions() do
+      if Pos(Lowercase(w), Lowercase(opt.Text)) > 0 then
+      begin
+        pick := opt;
+        found := True;
+        Break;
+      end;
+    if found then
+      Break;
+  end;
+  if not found then
+  begin
+    Logger.Info('Gate: no ' + ToStr(wanted) + ' in the menu: ' + menu);
+    CancelMenu();
+    Exit;
+  end;
+  Logger.Info('Gate: clicking "' + pick.Text + '" (menu: ' + menu + ').');
+  ChooseOption.Select(pick);
+  Result := True;
+end;
+
+// Through the toll gate, from whichever side we're on - by trying it, no settings needed:
+//   1. "Open": with Prince Ali Rescue done it just lets us through (free). Remembered.
+//   2. Not through: a guard talking to us -> with 10+ coins answer yes (pays the toll).
+//   3. Still not through: "Pay-toll" (free with Prince Ali Rescue, else needs 10 coins).
+//   4. Still not through / the gate hasn't got these options: we can't get through here
+//      (the caller then walks the long way round the fence).
+function TMiner.CrossTollGate(): Boolean;
+var
+  gate: TObject;
+  approach: TPoint;
+  wasInside: Boolean;
+  coins: Integer;
+  menu: String;
+  endAt: UInt64;
+begin
+  wasInside := InAlKharid(Map.Position());
+  if wasInside then
+    approach := GATE_EAST
+  else
+    approach := GATE_WEST;
+  Logger.Info('Gate: to the toll gate.');
+  if not SafeWebWalk(approach, 240000, 2) then
+  begin
+    Logger.Warn('Gate: could not walk to the toll gate (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(500, 900);
+
+  if not NearestObject(['Gate', 'Toll gate'], TOLL_GATE, 5, gate) then
+  begin
+    Logger.Warn('Gate: WaspLib knows no gate here - assuming we can''t get through.');
+    Exit;
+  end;
+  coins := CoinCount();
+  Logger.Info('Gate: ' + ToStr(coins) + ' coins in the inventory.');
+
+  // 1) Open (free with Prince Ali Rescue)
+  if GateMenu(gate, ['Open', 'Ooen', 'pen Gate', 'en Gate'], menu) then
+  begin
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 5000) then
+    begin
+      Logger.Info('Gate: through for free (Prince Ali Rescue done), now at ' + Here() + '.');
+      Self.PrinceAli := True;          // remembered for the rest of the run
+      Exit(True);
+    end;
+
+    // 2) the guard wants paying: answer yes when we have the coins, otherwise talk it out
+    endAt := GetTimeRunning() + 8000;
+    repeat
+      if InAlKharid(Map.Position()) <> wasInside then
+        Break;
+      if Chat.ContainsContinue() then
+        Chat.Continue()
+      else if coins >= TOLL_COINS then
+        Chat.Options.Select('Yes', False)
+      else if not Chat.Options.Select('No', False) then
+        Sleep(200);
+      Sleep(400, 700);
+    until GetTimeRunning() > endAt;
+    if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 3000) then
+    begin
+      Logger.Info('Gate: through (paid the guard), now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3) Pay-toll - tried even without coins: with Prince Ali Rescue done it may be free
+  if True then
+    if GateMenu(gate, ['oll', 'Pay'], menu) then
+      if SleepUntil(InAlKharid(Map.Position()) <> wasInside, 300, 8000) then
+      begin
+        Logger.Info('Gate: through (paid the toll), now at ' + Here() + '.');
+        Exit(True);
+      end;
+
+  // 4) no way through here
+  if coins < TOLL_COINS then
+    Logger.Warn('Gate: not let through and fewer than ' + ToStr(TOLL_COINS) + ' coins - assuming we can''t get through.')
+  else
+    Logger.Warn('Gate: not let through (gate menu: ' + menu + ') - assuming we can''t get through.');
+end;
+
+// The long way round the fence: WaspLib's walker from point to point of your recorded walk,
+// starting at the point nearest to us (so it works from anywhere along the way).
+function WalkLongWay(intoAlKharid: Boolean): Boolean;
+var
+  path: TPointArray;
+  i, k, start: Integer;
+  me: TPoint;
+  best: Double;
+begin
+  // (written out plainly: the "if ... for ... else for ..." version left the path empty)
+  SetLength(path, Length(LONG_WAY));
+  for i := 0 to High(LONG_WAY) do
+  begin
+    k := i;
+    if not intoAlKharid then
+      k := High(LONG_WAY) - i;
+    path[i] := Tile(LONG_WAY[k].X, LONG_WAY[k].Y);
+  end;
+  if Length(path) = 0 then
+    Exit(False);
+
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < best then
+    begin
+      best := me.DistanceTo(path[i]);
+      start := i;
+    end;
+
+  // far from the fence: get to its start first
+  if best > 15 * RSTranslator.TILE_SIZE then
+  begin
+    start := 0;
+    if not SafeWebWalk(path[0], 240000, 4) then
+    begin
+      Logger.Warn('Long way: could not reach the start of the walk (we are at ' + Here() + ').');
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Long way: walking round the fence (' + ToStr(Length(path) - start) + ' points).');
+  for i := start to High(path) do
+    if not SafeWebWalk(path[i], 40000, 3) then
+    begin
+      Logger.Warn('Long way: stuck at point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + ' (we are at ' + Here() + ').');
+      Exit;
+    end;
+
+  Result := InAlKharid(Map.Position()) = intoAlKharid;
+  if Result then
+    Logger.Info('Long way: done, now at ' + Here() + '.');
+end;
+
+// Underground (Dwarven Mine / Mining Guild)? Those areas sit far north on WaspLib's map.
+function Underground(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  Result := ((me.X <> 0) or (me.Y <> 0)) and (me.Y < 20000);
+end;
+
+// A shut door WaspLib knows right next to us (within 4 tiles): open it. Only WaspLib's door,
+// no looking around the screen. True = we opened one.
+function OpenNearbyShutDoor(): Boolean;
+var
+  door: TObject;
+begin
+  if not NearestObject(['Door', 'Large door', 'Gate'], Map.Position(), 4, door) then
+    Exit;
+  try
+    if not door.Hover([]) then
+      Exit;
+  except
+    Exit;
+  end;
+  if not MainScreen.IsUpText(['Open'], True, 0.85, 60) then
+    Exit;                                 // it's open already (hover text says Close)
+  Logger.Info('Door: a shut door is in the way - opening it.');
+  Mouse.Click(EMouseButton.LEFT);
+  Result := MainScreen.WaitRedClick(600);
+  Sleep(900, 1400);
+  Map.Walker.WaitMoving();
+end;
+
+// Use the ladder WaspLib knows next to `spot` ("Climb-down" / "Climb-up").
+// - the walk there gets one more go after opening a shut door next to us (players close the
+//   doors of the Mining Guild ladder building)
+// - up to 2 tries on the ladder: first a left click when the hover text says Climb, otherwise
+//   (or on the 2nd try) right-click and pick Climb-down / Climb-up from the menu
+function UseLadder(spot: TPoint; goingDown: Boolean): Boolean;
+var
+  ladder: TObject;
+  wasUnder, hovered: Boolean;
+  attempt: Integer;
+  option: String;
+begin
+  wasUnder := Underground();
+  if goingDown then
+    option := 'Climb-down'
+  else
+    option := 'Climb-up';
+
+  if not SafeWebWalk(spot, 240000, 3) then
+  begin
+    if OpenNearbyShutDoor() and SafeWebWalk(spot, 60000, 3) then
+      Logger.Info('Ladder: through the door, carrying on.')
+    else
+    begin
+      Logger.Warn('Ladder: could not walk to it (we are at ' + Here() + ').');
+      Exit;
+    end;
+  end;
+  Map.Walker.WaitMoving();
+
+  if not NearestObject(['Ladder'], spot, 6, ladder) then
+  begin
+    Logger.Warn('Ladder: WaspLib knows no ladder here.');
+    Exit;
+  end;
+
+  if goingDown then
+    Logger.Info('Ladder: climbing down.')
+  else
+    Logger.Info('Ladder: climbing up.');
+
+  for attempt := 1 to 2 do
+  begin
+    hovered := False;
+    try
+      hovered := ladder.Hover([]);
+      if not hovered then
+        hovered := ladder.WalkHover([]);
+    except
+      Logger.Warn('Ladder: ' + GetExceptionMessage());
+    end;
+    if not hovered then
+    begin
+      Logger.Warn('Ladder: could not hover it.');
+      Continue;
+    end;
+
+    if (attempt = 1) and MainScreen.IsUpText(['Climb'], True, 0.85, 60) then
+      Mouse.Click(EMouseButton.LEFT)
+    else
+    begin
+      // something else is on top (a player, "Walk here"...): pick it from the menu
+      Mouse.Click(EMouseButton.RIGHT);
+      if not (SleepUntil(ChooseOption.IsOpen(), 50, 1500) and ChooseOption.Select([option, 'Climb'])) then
+      begin
+        Logger.Warn('Ladder: no "' + option + '" in the menu.');
+        CancelMenu();
+        Continue;
+      end;
+    end;
+
+    Map.Walker.WaitMoving();
+    Sleep(1800, 2600);                    // the short loading pause
+    if SleepUntil(Underground() <> wasUnder, 300, 9000) then
+    begin
+      Logger.Info('Ladder: done, now at ' + Here() + '.');
+      Activity.Restart();
+      Exit(True);
+    end;
+    Logger.Warn('Ladder: still on the same level after clicking it (try ' + ToStr(attempt) + ' of 2).');
+  end;
+end;
+
+// Open the door WaspLib knows next to `spot` if it is shut. A left click is all it takes.
+// `shutText` is its hover text while it is shut ("Open Door", "Open Guild Door"), `openText`
+// what it says once it is open. True = it is open now (or was already).
+function OpenDoorAt(spot: TPoint; names: TStringArray; shutText, openText: String): Boolean;
+var
+  door: TObject;
+  hovered: Boolean;
+begin
+  if NearestObject(names, spot, 6, door) then
+  begin
+    try
+      hovered := door.WalkHover([]);
+    except
+      Logger.Warn('Door: ' + GetExceptionMessage());
+    end;
+  end
+  else
+    Logger.Info('Door: WaspLib knows no door here - looking for its hover text around us.');
+
+  // fallback: we're standing next to the door, so sweep the mouse out from the middle of the
+  // screen until it reads the door's text (shut or open)
+  if not hovered then
+    hovered := HoverFind(MainScreen.Bounds.Center, [shutText, openText], 220, 12);
+  if not hovered then
+  begin
+    Logger.Warn('Door: could not find it on the screen ("' + shutText + '").');
+    Exit;
+  end;
+
+  if MainScreen.IsUpText([openText], True, 0.85, 50) then
+  begin
+    Logger.Info('Door: already open.');
+    Exit(True);
+  end;
+
+  Logger.Info('Door: opening it ("' + shutText + '").');
+  Mouse.Click(EMouseButton.LEFT);
+
+  // a red click = the game took it. No red click = we missed: say so, don't count it as done.
+  if not MainScreen.WaitRedClick(600) then
+  begin
+    Logger.Warn('Door: no red click - the click missed it.');
+    Exit;
+  end;
+
+  // the guild door walks you through it: give that time and wait until we've stopped moving,
+  // so nothing clicks the door again (which would walk us straight back)
+  Sleep(1200, 1800);
+  Map.Walker.WaitMoving();
+  SleepUntil(not Minimap.IsPlayerMoving(), 150, 5000);
+  Sleep(600, 1000);
+  Logger.Info('Door: through, now at ' + Here() + '.');
+  Result := True;
+end;
+
+// Open the door near `doorSpot` if it's shut, then climb down the staircase near `stairSpot`.
+// Both are plain left clicks.
+function UseDoorThenStairs(doorSpot, stairSpot: TPoint): Boolean;
+var
+  stairs: TObject;
+begin
+  if not SafeWebWalk(doorSpot, 240000, 4) then
+  begin
+    Logger.Warn('Door: could not walk to it (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  if not OpenDoorAt(doorSpot, ['Door'], 'Open Door', 'Close Door') then
+    Logger.Warn('Door: carrying on to the staircase anyway.');
+
+  if not SafeWebWalk(stairSpot, 60000, 3) then
+  begin
+    Logger.Warn('Door: could not reach the staircase (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  if not NearestObject(['Staircase'], stairSpot, 6, stairs) then
+  begin
+    Logger.Warn('Door: WaspLib knows no staircase here.');
+    Exit;
+  end;
+
+  Logger.Info('Door: climbing down the staircase.');
+  try
+    if not stairs.WalkHover([]) then
+    begin
+      Logger.Warn('Door: could not hover the staircase.');
+      Exit;
+    end;
+  except
+    Logger.Warn('Door: ' + GetExceptionMessage());
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.LEFT);
+  Map.Walker.WaitMoving();
+  Sleep(1800, 2600);                      // the short loading pause
+
+  Result := SleepUntil(Underground(), 300, 9000);
+  if Result then
+  begin
+    Logger.Info('Door: done, now at ' + Here() + '.');
+    Activity.Restart();
+  end
+  else
+    Logger.Warn('Door: still on the surface after climbing down.');
+end;
+
+// Climb up the staircase near `stairSpot` ("Climb-up staircase", a plain left click).
+function UseStairsUp(stairSpot: TPoint): Boolean;
+var
+  stairs: TObject;
+begin
+  if not SafeWebWalk(stairSpot, 240000, 3) then
+  begin
+    Logger.Warn('Stairs: could not walk to it (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  if not NearestObject(['Staircase'], stairSpot, 6, stairs) then
+  begin
+    Logger.Warn('Stairs: WaspLib knows no staircase here.');
+    Exit;
+  end;
+
+  Logger.Info('Stairs: climbing up.');
+  try
+    if not stairs.WalkHover([]) then
+    begin
+      Logger.Warn('Stairs: could not hover it.');
+      Exit;
+    end;
+  except
+    Logger.Warn('Stairs: ' + GetExceptionMessage());
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.LEFT);
+  Map.Walker.WaitMoving();
+  Sleep(1800, 2600);
+
+  Result := SleepUntil(not Underground(), 300, 9000);
+  if Result then
+  begin
+    Logger.Info('Stairs: done, now at ' + Here() + '.');
+    Activity.Restart();
+  end
+  else
+    Logger.Warn('Stairs: still underground after climbing up.');
+end;
+
+// Go down into the mine, or back up out of it, whichever way this mine's entrance works
+// (ladder, or door+staircase).
+function UseEntrance(const mine: TMineInfo; goingDown: Boolean): Boolean;
+begin
+  if mine.EntranceKind = EK_DOOR_STAIRS then
+  begin
+    if goingDown then
+      Result := UseDoorThenStairs(mine.Door, mine.Entrance)
+    else
+      Result := UseStairsUp(mine.Inside);
+  end
+  else
+  begin
+    if goingDown then
+      Result := UseLadder(mine.Entrance, True)
+    else
+      Result := UseLadder(mine.Inside, False);
+  end;
+end;
+
+// Mines behind a guild door (Crafting Guild): walk to the door and open it if it is shut, so the
+// walker can carry on through it. Done on the way in and on the way out.
+// It only opens if you have the level and the apron on: if the door stays shut, that's why.
+function TMiner.PassGuildDoor(): Boolean;
+begin
+  if Self.Mine.EntranceKind <> EK_SURFACE_DOOR then
+    Exit(True);
+
+  Logger.Info('Guild: to the ' + Self.Mine.Name + ' door.');
+  if not SafeWebWalk(Self.Mine.Door, 240000, 4) then
+  begin
+    Logger.Warn('Guild: could not walk to the guild door (we are at ' + Here() + ').');
+    Exit;
+  end;
+  Map.Walker.WaitMoving();
+
+  Result := OpenDoorAt(Self.Mine.Door, ['Guild door', 'Door'], 'Open Guild Door', 'Close Guild Door');
+end;
+
+// Does the walk from here to `dest` go through the toll gate?
+function NeedsGate(dest: TPoint): Boolean;
+begin
+  Result := InAlKharid(Map.Position()) <> InAlKharid(dest);
+end;
+
+// Did a walk get us nowhere (still within 3 tiles of where it started)? Then we are most
+// likely shut in a building.
+function NotMoved(start: TPoint): Boolean;
+begin
+  Result := Map.Position().DistanceTo(start) < 3 * RSTranslator.TILE_SIZE;
+end;
+
+// Stuck inside a building (a closed door between us and everything else). In order:
+//   1. try to walk out: click towards `target` and let the game find a way (an open exit)
+//   2. look for a door (or gate) next to us and open it, then walk out
+//   3. Home Teleport to Lumbridge
+//   4. give up: stop and ask for a restart outside
+// True = we got out (or teleported), so the walk can be tried again.
+function TMiner.GetOutside(target: TPoint): Boolean;
+var
+  start: TPoint;
+begin
+  Logger.Warn('Stuck: the walk got us nowhere - we may be shut inside a building.');
+
+  // 1. walk out
+  start := Map.Position();
+  Logger.Info('Stuck: trying to walk out.');
+  try
+    Map.Walker.WalkBlind(target, 2);
+  except
+  end;
+  Map.Walker.WaitMoving();
+  if not NotMoved(start) then
+  begin
+    Logger.Info('Stuck: got moving again, now at ' + Here() + '.');
+    Exit(True);
+  end;
+
+  // 2. a door or gate next to us
+  Logger.Info('Stuck: looking for a door to open.');
+  if OpenDoorAt(Map.Position(), ['Door', 'Large door', 'Doors'], 'Open Door', 'Close Door') or
+     OpenDoorAt(Map.Position(), ['Gate', 'Large gate'], 'Open Gate', 'Close Gate') then
+  begin
+    start := Map.Position();
+    try
+      Map.Walker.WalkBlind(target, 2);
+    except
+    end;
+    Map.Walker.WaitMoving();
+    if not NotMoved(start) then
+    begin
+      Logger.Info('Stuck: out through the door, now at ' + Here() + '.');
+      Exit(True);
+    end;
+  end;
+
+  // 3. teleport out
+  Logger.Info('Stuck: no way out found - trying Home Teleport.');
+  if Self.HomeTeleport() then
+    Exit(True);
+
+  // 4. give up
+  Self.StopReason := 'Stuck inside a building at ' + Here() + ' and could not get out. ' +
+                     'Restart the script outside.';
+end;
+
+// From wherever we are to the mine: WaspLib's walker, then Home Teleport + walker.
+procedure TMiner.GoToMine();
+var
+  crossed: Boolean;
+  start: TPoint;
+begin
+  if CurrentFloor() > 0 then
+  begin
+    if not Self.LeaveTopFloor() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not get down the Lumbridge Castle stairs.';
+      Exit;
+    end;
+  end;
+
+  // underground mine: down the entrance. Not an underground mine but we are below: come up.
+  if Self.Mine.Underground and not Underground() then
+  begin
+    if not UseEntrance(Self.Mine, True) then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 5 then
+        Self.StopReason := 'Could not climb down to ' + Self.Mine.Name + '. Please post this log in a GitHub issue.'
+      else
+        Sleep(1500, 3000);
+      Exit;
+    end;
+  end
+  else if (not Self.Mine.Underground) and Underground() then
+  begin
+    if not UseEntrance(Self.Mine, False) then
+    begin
+      Inc(Self.Failures);
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Travel: to ' + Self.Mine.Name + ' (' +
+              ToStr(Round(Map.Position().DistanceTo(Self.MineCenter) / RSTranslator.TILE_SIZE)) + ' tiles).');
+
+  // the fence between Lumbridge and Al Kharid is in the way (WaspLib's walker can't open the
+  // gate): the toll gate with Prince Ali Rescue or 10+ coins, otherwise the long way round
+  if NeedsGate(Self.MineCenter) then
+  begin
+    // try the gate (it finds out itself whether we pass for free or have to pay)
+    crossed := Self.CrossTollGate();
+    if not crossed then
+    begin
+      Logger.Info('Travel: the toll gate is no good - taking the long way round the fence.');
+      crossed := WalkLongWay(InAlKharid(Self.MineCenter));
+    end;
+
+    if not crossed then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 3 then
+        Self.StopReason := 'Could not get past the Al Kharid fence (gate or long way). Please post this log in a GitHub issue.';
+      Exit;
+    end;
+  end;
+
+  // a guild door on the way in (Crafting Guild)
+  if (Self.Mine.EntranceKind = EK_SURFACE_DOOR) and not Self.InsideGuild() then
+    if not Self.PassGuildDoor() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 3 then
+        Self.StopReason := 'Could not get through the ' + Self.Mine.Name + ' door. Check you have ' +
+                           ToStr(Self.Mine.ReqCraft) + ' Crafting and a ' + CRAFT_APRON + ' worn.';
+      Exit;
+    end;
+
+  // inside the guild WaspLib's walker would route us back out (to it the inside is cut off),
+  // so walk the last few tiles to the rocks "blind": the game finds the way itself
+  if (Self.Mine.EntranceKind = EK_SURFACE_DOOR) and Self.InsideGuild() then
+  begin
+    Logger.Info('Guild: inside - walking straight to the rocks.');
+    try
+      Map.Walker.WalkBlind(Self.MineCenter, 2);
+    except
+      Logger.Warn('Guild: ' + GetExceptionMessage());
+    end;
+    Map.Walker.WaitMoving();
+    if Self.AtMine() then
+    begin
+      Logger.Info('Travel: at ' + Self.Mine.Name + '.');
+      Self.Failures := 0;
+      Activity.Restart();
+    end
+    else
+      Inc(Self.Failures);
+    Exit;
+  end;
+
+  start := Map.Position();
+  if SafeWebWalk(Self.MineCenter, 300000, Self.Mine.Radius) then
+  begin
+    Logger.Info('Travel: at ' + Self.Mine.Name + '.');
+    Self.Failures := 0;
+    Activity.Restart();
+    Exit;
+  end;
+
+  // didn't move at all: shut in somewhere? Get out, then try the walk again
+  if (not Self.Mine.Underground) and NotMoved(start) then
+  begin
+    if not Self.GetOutside(Self.MineCenter) then
+      Exit;
+    if SafeWebWalk(Self.MineCenter, 300000, Self.Mine.Radius) then
+    begin
+      Logger.Info('Travel: at ' + Self.Mine.Name + '.');
+      Self.Failures := 0;
+      Activity.Restart();
+      Exit;
+    end;
+  end;
+
+  // the straight walk got stuck (WaspLib's map has a shortcut through a fence that isn't
+  // there): go by way of this mine's bank, which WaspLib reaches along proper roads
+  if not Self.Mine.Underground then
+  begin
+    Logger.Info('Travel: the direct walk failed - going by way of ' + Self.Mine.BankName + ' bank.');
+    if SafeWebWalk(Tile(Self.Mine.BankSpot.X, Self.Mine.BankSpot.Y), 300000, 6) and
+       SafeWebWalk(Self.MineCenter, 300000, Self.Mine.Radius) then
+    begin
+      Logger.Info('Travel: at ' + Self.Mine.Name + ' (via the bank).');
+      Self.Failures := 0;
+      Activity.Restart();
+      Exit;
+    end;
+  end;
+
+  if Self.Teleports < 3 then
+    if Self.HomeTeleport() and SafeWebWalk(Self.MineCenter, 300000, Self.Mine.Radius) then
+    begin
+      Logger.Info('Travel: at ' + Self.Mine.Name + ' (via Lumbridge).');
+      Self.Failures := 0;
+      Activity.Restart();
+      Exit;
+    end;
+
+  Inc(Self.Failures);
+  if Self.Failures >= 3 then
+    Self.StopReason := 'WaspLib''s walker can''t reach ' + Self.Mine.Name + ' from ' + Here() +
+                       '. This mine needs a recorded route - please post this log in a GitHub issue.';
+end;
+
+// ---------------------------------------------------------------- mining
+
+function TMiner.OreCount(): Integer;
+var
+  o: Integer;
+begin
+  for o := 0 to High(ORE_ITEMS) do
+    if Self.Want[o] then
+      Result += Inventory.Items.Count(ORE_ITEMS[o]);
+end;
+
+// Strict ore priority: adamant, then mithril, gold, coal, silver, iron, tin, copper, clay (the
+// order of ORE_ROCKS, best last). Of the best ore that has a rock ready (not mined recently /
+// not seen empty), take the nearest rock. Only when every rock of that ore is used up does it
+// move on to the next ore down. This runs again before every rock, so as soon as a better
+// ore's rock is due to be back (its respawn time is up), it goes back to that one.
+function TMiner.PickRock(): Integer;
+var
+  me: TPoint;
+  i, bestOre: Integer;
+  best, d: Double;
+  now: UInt64;
+begin
+  Result := -1;
+  me := Map.Position();
+  now := GetTimeRunning();
+
+  // the best ore with at least one rock ready
+  bestOre := -1;
+  for i := 0 to High(Self.Rocks) do
+    if (Self.Rocks[i].FreeAt <= now) and (Self.Rocks[i].Ore > bestOre) then
+      bestOre := Self.Rocks[i].Ore;
+  if bestOre = -1 then
+    Exit;
+
+  // the nearest ready rock of that ore
+  best := 1000000000;
+  for i := 0 to High(Self.Rocks) do
+  begin
+    if (Self.Rocks[i].Ore <> bestOre) or (Self.Rocks[i].FreeAt > now) then
+      Continue;
+    d := Self.Rocks[i].Spot.DistanceTo(me);
+    if d < best then
+    begin
+      best := d;
+      Result := i;
+    end;
+  end;
+
+  if bestOre <> Self.LastOre then
+  begin
+    if Self.LastOre >= 0 then
+      Logger.Info('Mine: now mining ' + ORE_WORDS[bestOre] + ' (best ore with a rock ready).');
+    Self.LastOre := bestOre;
+  end;
+end;
+
+// How long to keep swinging at one rock with no ore (like the woodcutter). Low level for the ore =
+// longer: you fail a lot, the rock still has its ore (the "Rocks" check moves on straight away
+// if it's mined out). Within 10 levels of the ore: x3, within 20: x2.
+function TMiner.Patience(ore: Integer): Integer;
+var
+  over: Integer;
+begin
+  Result := ORE_PATIENCE[ore];
+  if Self.MiningLevel <= 0 then
+    Exit;
+  over := Self.MiningLevel - ORE_LEVELS[ore];
+  if over < 10 then
+    Result := Result * 3
+  else if over < 20 then
+    Result := Result * 2;
+end;
+
+function SecsStr(ms: Integer): String;
+begin
+  Result := ToStr(Round(ms / 1000)) + ' s';
+end;
+
+// Count every ore that turned up in the inventory since we last looked - also ones that arrive
+// late (after we've moved on from a rock) - so the total is the real number. The count going
+// down (banked / dropped) just resets it.
+function TMiner.SyncOres(): Integer;
+var
+  n: Integer;
+begin
+  n := Self.OreCount();
+  if Self.SeenOres < 0 then        // first look: what we started with isn't counted
+  begin
+    Self.SeenOres := n;
+    Exit;
+  end;
+  if n > Self.SeenOres then
+  begin
+    Result := n - Self.SeenOres;
+    Self.Ores += Result;
+  end;
+  Self.SeenOres := n;
+end;
+
+// While every rock is on its respawn timer, look at them on the screen anyway (one per call,
+// in turn): rocks often come back sooner than the timer, e.g. when someone else mined them
+// first. A rock that shows its ore again is ready straight away.
+procedure TMiner.PeekRock();
+var
+  k, n: Integer;
+  ok: Boolean;
+begin
+  n := Length(Self.Rocks);
+  if n = 0 then
+    Exit;
+  for k := 1 to n do
+  begin
+    Self.PeekAt := (Self.PeekAt + 1) mod n;
+    if Self.Rocks[Self.PeekAt].FreeAt = High(UInt64) then   // never used (members side etc.)
+      Continue;
+    ok := False;
+    try
+      if Self.Rocks[Self.PeekAt].Obj.IsVisible() then
+        ok := Self.Rocks[Self.PeekAt].Obj.Hover([]);
+    except
+      ok := False;
+    end;
+    if not ok then
+      Continue;
+    if MainScreen.IsUpText([ORE_WORDS[Self.Rocks[Self.PeekAt].Ore]], True, 0.85, 60) then
+    begin
+      Logger.Info('Mine: a ' + ORE_WORDS[Self.Rocks[Self.PeekAt].Ore] + ' rock is back already.');
+      Self.Rocks[Self.PeekAt].FreeAt := 0;
+    end;
+    Exit;          // one rock per call
+  end;
+end;
+
+procedure TMiner.DoMine();
+var
+  i, before, patience: Integer;
+  word: String;
+  got, hovered: Boolean;
+  deadline, nextLook, nextClick, startAt: UInt64;
+begin
+  if Self.SyncOres() > 0 then
+    Logger.Info('Mine: an ore came in late (' + ToStr(Self.Ores) + ' total, inventory ' +
+                ToStr(Inventory.Slots.Count()) + '/28).');
+  i := Self.PickRock();
+  if i = -1 then
+  begin
+    if not Self.WaitLogged then
+      Logger.Info('Mine: every rock is mined out, waiting for one to come back.');
+    Self.WaitLogged := True;
+    Self.PeekRock();
+    Sleep(800, 1500);
+    Exit;
+  end;
+  Self.WaitLogged := False;
+
+  word := ORE_WORDS[Self.Rocks[i].Ore];
+
+  // hover it (WaspLib walks closer if it isn't on screen). In a guild WaspLib's walker would
+  // route us out of the door, so there we walk blind to the rock and only hover it.
+  try
+    if Self.Mine.EntranceKind = EK_SURFACE_DOOR then
+    begin
+      if not Self.Rocks[i].Obj.IsVisible() then
+      begin
+        Map.Walker.WalkBlind(Self.Rocks[i].Spot, 1);
+        Map.Walker.WaitMoving();
+      end;
+      hovered := Self.Rocks[i].Obj.Hover(['Mine']);
+    end
+    else
+      hovered := Self.Rocks[i].Obj.WalkHover(['Mine']);
+
+    if not hovered then
+    begin
+      Self.Rocks[i].FreeAt := GetTimeRunning() + 3000;
+      Exit;
+    end;
+  except
+    Logger.Warn('Mine: hovering the rock failed: ' + GetExceptionMessage());
+    Self.Rocks[i].FreeAt := GetTimeRunning() + 3000;
+    Exit;
+  end;
+
+  // a depleted rock is just "Rocks"
+  if not MainScreen.IsUpText([word], True, 0.85, 80) then
+  begin
+    Self.Rocks[i].FreeAt := GetTimeRunning() + Min(ORE_RESPAWN[Self.Rocks[i].Ore] div 2, 30000);
+    Exit;
+  end;
+
+  before := Self.OreCount();
+  patience := Self.Patience(Self.Rocks[i].Ore);
+  Mouse.Click(EMouseButton.LEFT);
+  Logger.Info('Mine: mining a ' + word + ' rock ' +
+              ToStr(Round(Self.Rocks[i].Spot.DistanceTo(Map.Position()) / RSTranslator.TILE_SIZE)) +
+              ' tiles away (patience ' + SecsStr(patience) + ', ' + ToStr(Self.OreCount()) + ' ores in the inventory).');
+
+  // wait for the ore - up to ORE_PATIENCE for this ore (a minute or more for mithril and
+  // adamant). Every few seconds, once we've stopped walking, look at the rock again: if its
+  // hover text is just "Rocks" it's been mined out (by us or someone else) -> next rock.
+  // Still has ore after a while: click it again, in case the swing got interrupted.
+  // Safety net: if that click sends us walking out of the mine (a rock we can't really reach,
+  // e.g. the members side), never use that rock again.
+  got := False;
+  startAt := GetTimeRunning();
+  deadline := startAt + patience;
+  nextLook := GetTimeRunning() + 3000;
+  nextClick := GetTimeRunning() + 15000;
+  repeat
+    if Self.OreCount() > before then
+    begin
+      got := True;
+      Break;
+    end;
+
+    if (GetTimeRunning() > nextLook) and not Minimap.IsPlayerMoving() then
+    begin
+      nextLook := GetTimeRunning() + Random(2500, 4000);
+      try
+        Self.Rocks[i].Obj.Hover([]);
+      except
+      end;
+      if MainScreen.IsUpText(['Rocks'], True, 0.85, 60) and not MainScreen.IsUpText([word], True, 0.85, 30) then
+      begin
+        Logger.Info('Mine: that ' + word + ' rock is mined out - next rock.');
+        Self.Rocks[i].FreeAt := GetTimeRunning() + ORE_RESPAWN[Self.Rocks[i].Ore];
+        Exit;
+      end;
+      if (GetTimeRunning() > nextClick) and MainScreen.IsUpText([word], True, 0.85, 30) then
+      begin
+        nextClick := GetTimeRunning() + Random(14000, 20000);
+        Mouse.Click(EMouseButton.LEFT);
+        Logger.Info('Mine: no ore for ' + SecsStr(GetTimeRunning() - startAt) + ' - clicking the rock again.');
+      end;
+    end;
+
+    if Map.Position().DistanceTo(Self.MineCenter) > (Self.Mine.Radius + 8) * RSTranslator.TILE_SIZE then
+    begin
+      Logger.Warn('Mine: that rock is leading us out of the mine (members side?) - never using it again.');
+      Self.Rocks[i].FreeAt := High(UInt64);
+      SafeWebWalk(Self.MineCenter, 60000, Self.Mine.Radius);
+      Exit;
+    end;
+    Sleep(150);
+  until GetTimeRunning() > deadline;
+
+  if got then
+  begin
+    Self.SyncOres();
+    Self.Rocks[i].FreeAt := GetTimeRunning() + ORE_RESPAWN[Self.Rocks[i].Ore];
+    Logger.Info('Mine: got ' + ORE_ITEMS[Self.Rocks[i].Ore] + ' (' + ToStr(Self.Ores) + ' total, inventory ' +
+                ToStr(Inventory.Slots.Count()) + '/28).');
+    Self.Failures := 0;
+    Activity.Restart();
+  end
+  else
+  begin
+    Logger.Info('Mine: no ore for ' + SecsStr(patience) + ' - trying another rock.');
+    Self.Rocks[i].FreeAt := GetTimeRunning() + 4000;
+  end;
+end;
+
+// ---------------------------------------------------------------- bank / drop
+
+// Take the best pickaxe out of the bank that our Mining level allows.
+function TMiner.WithdrawPickaxe(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(BANK_PICKAXES) do
+  begin
+    if Self.MiningLevel < BANK_PICKAXE_LEVELS[i] then
+      Continue;
+
+    Logger.Info('Bank: looking for a ' + BANK_PICKAXES[i] + '.');
+    Bank.Withdraw(new TBankItem(BANK_PICKAXES[i], 1));
+    if SleepUntil(Inventory.Items.Count(BANK_PICKAXES[i]) > 0, 100, 2000) then
+    begin
+      Logger.Info('Bank: took out a ' + BANK_PICKAXES[i] + '.');
+      Exit(True);
+    end;
+  end;
+end;
+
+// Guild mines: get a brown apron on. Already worn -> done; in the inventory -> wear it;
+// otherwise take one out of the open bank and wear that.
+function TMiner.WearApron(): Boolean;
+begin
+  // the bank is open here: take an apron out if we aren't carrying one
+  if Bank.IsOpen() and (Inventory.Items.Count(CRAFT_APRON) = 0) then
+  begin
+    Logger.Info('Bank: looking for a ' + CRAFT_APRON + '.');
+    Bank.Withdraw(new TBankItem(CRAFT_APRON, 1));
+    if SleepUntil(Inventory.Items.Count(CRAFT_APRON) > 0, 100, 2000) then
+      Logger.Info('Bank: took out a ' + CRAFT_APRON + '.')
+    else
+      Logger.Warn('Bank: no ' + CRAFT_APRON + ' in the bank.');
+  end;
+
+  // the equipment tab can't be read with the bank in the way
+  if Bank.IsOpen() then
+    Bank.Close();
+  Inventory.Open();
+
+  if WearingApron() then
+    Exit(True);
+  if Inventory.Items.Count(CRAFT_APRON) = 0 then
+    Exit;
+
+  Logger.Info('Putting the ' + CRAFT_APRON + ' on.');
+  try
+    Inventory.Items.Interact(CRAFT_APRON, 'Wear');
+  except
+    Logger.Warn('Apron: ' + GetExceptionMessage());
+    Exit;
+  end;
+  Result := SleepUntil(WearingApron(), 200, 4000);
+end;
+
+// Still missing an item the bank should give us (pickaxe, or the apron for a guild mine)?
+function TMiner.NeedsItems(): Boolean;
+begin
+  Result := (not Self.HavePick) or ((Self.Mine.ReqCraft > 0) and not Self.HaveApron);
+end;
+
+// Fetching items isn't an ore trip: go to the bank closest to US (shortest walk from here),
+// not the mine's bank. Banks across the Al Kharid toll gate only count if we can get through
+// (Prince Ali Rescue or 10+ coins). Underground or upstairs we keep the mine's bank.
+procedure TMiner.UseNearestBankForItems();
+var
+  from: TPoint;
+  i, d, best, bi: Integer;
+begin
+  from := Map.Position();
+  if ((from.X = 0) and (from.Y = 0)) or Underground() then
+    Exit;
+
+  bi := -1;
+  best := -1;
+  if CurrentFloor() = 2 then
+  begin
+    for i := 0 to High(BANK_NAMES) do
+      if BANK_NAMES[i] = 'Lumbridge Castle' then
+        bi := i;
+  end
+  else
+    for i := 0 to High(BANK_NAMES) do
+    begin
+      if from.DistanceTo(Tile(BANK_TILES[i].X, BANK_TILES[i].Y)) > 250 * RSTranslator.TILE_SIZE then
+        Continue;
+      d := WalkTiles(from, Tile(BANK_TILES[i].X, BANK_TILES[i].Y));
+      if d < 0 then
+        Continue;
+      // the other side of the toll gate: it gets through by trying (free with Prince Ali Rescue,
+      // 10 coins, or the long way round), so it only counts as closer if it's much closer
+      if (InAlKharid(from) <> InAlKharid(Tile(BANK_TILES[i].X, BANK_TILES[i].Y))) and not Self.PrinceAli then
+        d += 60;
+      if (best = -1) or (d < best) then
+      begin
+        best := d;
+        bi := i;
+      end;
+    end;
+
+  if (bi = -1) or (BANK_NAMES[bi] = Self.Mine.BankName) then
+    Exit;
+
+  Self.SavedBankName := Self.Mine.BankName;
+  Self.SavedBankSpot := Self.Mine.BankSpot;
+  Self.Mine.BankName := BANK_NAMES[bi];
+  Self.Mine.BankSpot := BANK_TILES[bi];
+  Self.FindBank();
+  Self.FetchSwitched := True;
+  Logger.Info('Bank: getting the items at the closest bank, ' + BANK_NAMES[bi] +
+              ', instead of ' + Self.SavedBankName + '.');
+end;
+
+// Items fetched: ore trips go back to the mine's own bank.
+procedure TMiner.RestoreMineBank();
+begin
+  if not Self.FetchSwitched then
+    Exit;
+  Self.Mine.BankName := Self.SavedBankName;
+  Self.Mine.BankSpot := Self.SavedBankSpot;
+  Self.FindBank();
+  Self.FetchSwitched := False;
+  Logger.Info('Bank: ore trips will use ' + Self.Mine.BankName + ' bank.');
+end;
+
+procedure TMiner.DoBank();
+var
+  opened: Boolean;
+  start, bankTile: TPoint;
+begin
+  // fetching a pickaxe/apron: the bank closest to us, not the mine's
+  if (not Bank.IsOpen()) and Self.NeedsItems() and not Self.FetchSwitched then
+    Self.UseNearestBankForItems();
+
+  // underground: up out of the mine before going to the bank
+  if (not Bank.IsOpen()) and Self.Mine.Underground and Underground() then
+    if not UseEntrance(Self.Mine, False) then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not climb up out of ' + Self.Mine.Name + '. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+
+  // a guild door on the way out (Crafting Guild). If it won't open, don't start the long walk
+  // (it would just walk into the shut door): try the door again next time round.
+  if (not Bank.IsOpen()) and (Self.Mine.EntranceKind = EK_SURFACE_DOOR) and Self.InsideGuild() then
+    if not Self.PassGuildDoor() then
+    begin
+      Inc(Self.Failures);
+      Logger.Warn('Guild: could not open the door on the way out (try ' + ToStr(Self.Failures) + ').');
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not open the ' + Self.Mine.Name + ' door to get out. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+
+  if (not Bank.IsOpen()) and (Self.Mine.BankName = 'Lumbridge Castle') then
+  begin
+    if not Self.OpenLumbridgeBank() then
+    begin
+      Inc(Self.Failures);
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not use the Lumbridge Castle bank. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+  end;
+
+  if not Bank.IsOpen() then
+  begin
+    Logger.Info('Bank: going to ' + Self.Mine.BankName + '.');
+    start := Map.Position();
+
+    // Walk there ourselves first: our walk has a time limit and stops when we haven't moved for
+    // 8 s. Bank.Open's own walking has neither, so it could keep trying a blocked route for ever.
+    bankTile := Tile(Self.Mine.BankSpot.X, Self.Mine.BankSpot.Y);
+    if Map.Position().DistanceTo(bankTile) > 8 * RSTranslator.TILE_SIZE then
+      SafeWebWalk(bankTile, 180000, 6);
+
+    // the last few tiles + opening: also with the stall check and a time limit
+    WalkStallSpot := Map.Position();
+    WalkStallSince := GetTimeRunning();
+    WalkDeadline := GetTimeRunning() + 45000;
+    try
+      if Self.HasBank then
+        opened := Bank.Open(Self.BankObj, True)
+      else
+        opened := Bank.Open(True);
+    except
+      Logger.Warn('Bank: opening failed: ' + GetExceptionMessage());
+    end;
+    WalkDeadline := 0;
+
+    if not (opened or Bank.IsOpen()) then
+    begin
+      // never left the spot AND not at the bank yet: shut in somewhere? (the guild has its own door
+      // handling). Standing at the bank when it won't open is not being stuck.
+      if NotMoved(start) and (Map.Position().DistanceTo(bankTile) > 8 * RSTranslator.TILE_SIZE) and
+         not ((Self.Mine.EntranceKind = EK_SURFACE_DOOR) and Self.InsideGuild()) then
+        Self.GetOutside(Tile(Self.Mine.BankSpot.X, Self.Mine.BankSpot.Y));
+      Inc(Self.Failures);
+      Logger.Warn('Bank: could not open the bank (we are at ' + Here() + ').');
+      if Self.Failures >= 4 then
+        Self.StopReason := 'Could not reach/open ' + Self.Mine.BankName + ' bank. Please post this log in a GitHub issue.';
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: depositing everything except the pickaxe and coins.');
+  if Bank.DepositDifferent(PICKAXES + ['Coins']) then
+    SleepUntil(not Inventory.Items.ContainsDifferent(PICKAXES + ['Coins']), 100, 3000);
+
+  // item check happens here: no pickaxe on us -> take the best one we can use
+  if not Self.HavePick then
+    Self.HavePick := CarriesUsablePickaxe(Self.MiningLevel) or Self.WithdrawPickaxe();
+  if (not Self.HavePick) and DebugMode then
+  begin
+    Logger.Warn('DEBUG: no pickaxe you can use - carrying on without one (the rocks won''t mine).');
+    Self.HavePick := True;
+  end;
+  if not Self.HavePick then
+  begin
+    Self.StopReason := 'No pickaxe in the inventory, worn, or in the bank that a level ' +
+                       ToStr(Self.MiningLevel) + ' miner can use.';
+    Bank.Close();
+    Exit;
+  end;
+
+  // same for the brown apron if this mine is behind a guild door
+  if (Self.Mine.ReqCraft > 0) and not Self.HaveApron then
+  begin
+    Self.HaveApron := Self.WearApron();
+    if (not Self.HaveApron) and DebugMode then
+    begin
+      Logger.Warn('DEBUG: no ' + CRAFT_APRON + ' - carrying on without one (the guild door won''t let you in).');
+      Self.HaveApron := True;
+    end;
+    if not Self.HaveApron then
+    begin
+      Self.StopReason := 'No ' + CRAFT_APRON + ' worn, in the inventory, or in the bank - ' +
+                         'it is needed to get into the ' + Self.Mine.Name + '.';
+      if Bank.IsOpen() then
+        Bank.Close();
+      Exit;
+    end;
+  end;
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  Bank.Close();
+  Activity.Restart();
+  Logger.Info('Bank: trip ' + ToStr(Self.Trips) + ' done. Back to ' + Self.Mine.Name + '.');
+  Self.RestoreMineBank();
+end;
+
+procedure TMiner.DoDrop();
+var
+  items: TItemArray;
+  o: Integer;
+  g: String;
+begin
+  for o := 0 to High(ORE_ITEMS) do
+    items += ORE_ITEMS[o];
+  for g in GEMS do
+    items += g;
+
+  Logger.Info('Drop: dropping the ores.');
+  Inventory.Drop(items);
+  Activity.Restart();
+end;
+
+// ---------------------------------------------------------------- main loop
+
+// A single misread position can land "in the Wilderness": only believe it after 3 reads.
+function ReallyInWilderness(): Boolean;
+var
+  i: Integer;
+begin
+  for i := 1 to 3 do
+  begin
+    if not InWilderness(Map.Position()) then
+      Exit(False);
+    if i < 3 then
+      Sleep(700, 900);
+  end;
+  Result := True;
+end;
+
+
+function TMiner.GetState(): EMinerState;
+begin
+  // in the Wilderness, or a walk tried to go there: log out and stop at once
+  if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+  begin
+    if Self.StopReason = '' then
+    begin
+      Logger.Error('WILDERNESS: we are in or heading into the Wilderness at ' + Here() + ' - logging out.');
+      try
+        Logout.Logout();
+      except
+      end;
+      Self.StopReason := 'Stopped at the Wilderness. Move the character out and restart.';
+    end;
+    Exit(EMinerState.STOP);
+  end;
+
+  if Self.StopReason <> '' then
+    Exit(EMinerState.STOP);
+  if Activity.IsFinished then
+    Exit(EMinerState.NO_ACTIVITY);
+  if not Client.IsLoggedIn() then
+    Exit(EMinerState.LOGIN);
+  if Chat.LeveledUp() then
+    Exit(EMinerState.LEVEL_UP);
+  if Bank.IsOpen() then
+    Exit(EMinerState.BANK);
+
+  // no pickaxe, or no apron for a guild mine: the bank first
+  if not Self.HavePick then
+    Exit(EMinerState.BANK);
+  if (Self.Mine.ReqCraft > 0) and not Self.HaveApron then
+    Exit(EMinerState.BANK);
+
+
+
+  if Inventory.IsFull() then
+  begin
+    if Self.PowerMine then
+      Exit(EMinerState.DROP);
+    Exit(EMinerState.BANK);
+  end;
+
+  // time's up: stop after banking what we have
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) then
+  begin
+    if (not Self.PowerMine) and (Self.OreCount() > 0) then
+      Exit(EMinerState.BANK);
+    Exit(EMinerState.MAX_TIME);
+  end;
+
+  if not Self.AtMine() then
+    Exit(EMinerState.GO_TO_MINE);
+
+  Result := EMinerState.MINE;
+end;
+
+procedure TMiner.Run();
+var
+  lvl: Integer;
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    if Self.State <> EMinerState.MINE then
+      Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      EMinerState.LOGIN: DoLoginSafe();
+      EMinerState.LEVEL_UP:
+        begin
+          Chat.HandleLevelUp();
+          lvl := Stats.GetLevel(ESkill.MINING, False);
+          Self.MiningLevel := Max(Self.MiningLevel, lvl);
+          Inventory.Open();
+          Logger.Info('LEVEL UP: Mining level is now ' + ToStr(lvl) + '.');
+        end;
+      EMinerState.BANK: Self.DoBank();
+      EMinerState.DROP: Self.DoDrop();
+      EMinerState.GO_TO_MINE: Self.GoToMine();
+      EMinerState.MINE: Self.DoMine();
+      EMinerState.NO_ACTIVITY, EMinerState.MAX_TIME, EMinerState.STOP: Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  if Self.StopReason <> '' then
+    Logger.Error('Stopped: ' + Self.StopReason)
+  else
+    Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+// ================================================================ RUNE ESSENCE
+// Your runeessenceminer script, folded in: picking "Rune essence mine" in the settings runs
+// this instead of the normal mine loop. Walk to Aubury (from anywhere: the whole F2P map is
+// loaded) -> Teleport -> mine essence -> portal out -> bank at Varrock East. Needs Rune
+// Mysteries (tick-box). Helpers are prefixed Ess so they don't clash with the miner's own (the
+// miner's PICKAXES, HasPickaxe, CancelMenu, SlowAntiban are shared).
+
+type
+  EEssState = enum(
+    LOGIN,
+    LEVEL_UP,
+    BANK,
+    OPEN_BANK,
+    TELEPORT,
+    MINE,
+    LEAVE_MINE,
+    NO_ACTIVITY,
+    MAX_TIME
+  );
+
+  TEssMiner = record
+    MaxTime: UInt64;
+    State: EEssState;
+    InMine: Boolean;
+    Mined, Trips: Integer;
+    Dir: Integer;              // which corner of the mine we went to (0..3)
+    Failures: Integer;
+    NoTeleport: Integer;       // times Aubury had no Teleport option (2 = Rune Mysteries not done)
+    Booth: TObject;            // the Varrock east bank booth right in front of the bank spot
+    HasBooth: Boolean;
+    Aubury: TEntity;           // Aubury, from WaspLib's NPC map data
+    HasAubury: Boolean;
+    Rocks, Portals: array of TObject;     // per rock area, from WaspLib's object data
+    HasRock, HasPortal: array of Boolean;
+  end;
+
+const
+  ESS_LOCAL_TILES = 9;     // closer than this, walk by clicking the tile on the main screen
+
+var
+  // Varrock east bank (standing in front of the booths) and Aubury, in WaspLib map pixels
+  ESS_BANK_SPOT: TPoint = [13012, 36750];
+  ESS_AUBURY_SPOT: TPoint = [13012, 36826];
+
+  // The essence mine has four rock areas, each with a portal next to it (your coordinate
+  // finder). Same order in both lists: ESS_MINE_SPOTS[i] goes with ESS_PORTAL_SPOTS[i].
+  ESS_MINE_SPOTS: TPointArray = [[11696, 31038], [11584, 31042], [11592, 31166], [11704, 31162]];
+  ESS_PORTAL_SPOTS: TPointArray = [[11724, 31014], [11544, 31030], [11560, 31178], [11728, 31170]];
+
+  // Your recorded walk from the bank to Aubury: out the north side, round the east, down
+  // to the shop (reversed for the way back)
+  ESS_ROUTE: TPointArray = [
+    [13016, 36750], [13016, 36726], [13036, 36718], [13040, 36738], [13040, 36770],
+    [13040, 36802], [13036, 36822], [13016, 36838], [13012, 36826]
+  ];
+
+
+  ESSENCE: TItem = 'Rune essence';
+
+
+var
+  // While WaspLib's walker runs, it calls EssWatchdog below. Past the deadline, or if a portal /
+  // teleport moves us to the other place mid-walk, the walk is stopped, so it can never hang.
+  EssWalkStartedInMine: Boolean;
+
+procedure TWalker.EssWatchdog(walker: PRSWalker; position, destination: TPoint);
+var
+  inVarrockNow: Boolean;
+begin
+  // (a destination hundreds of tiles away is a bad point from WaspLib's walker, e.g. on a
+  // floor it has no path for, not a real walk - only trust destinations near us)
+  if InWilderness(position) or
+     (InWilderness(destination) and (position.DistanceTo(destination) <= 150 * RSTranslator.TILE_SIZE)) then
+  begin
+    Logger.Error('Walk: this walk goes into the Wilderness - stopping it (at [' + ToStr(position.X) + ', ' +
+                 ToStr(position.Y) + '], heading to [' + ToStr(destination.X) + ', ' + ToStr(destination.Y) + ']).');
+    WildernessHit := True;
+    walker^.Walking := False;
+    WalkDeadline := 0;
+    Exit;
+  end;
+
+  if GetTimeRunning() > WalkLogAt then
+  begin
+    WalkLogAt := GetTimeRunning() + 3000;
+    Logger.Info('Walking: at [' + ToStr(position.X) + ', ' + ToStr(position.Y) + '], next point ' +
+                ToStr(Round(position.DistanceTo(destination) / RSTranslator.TILE_SIZE)) + ' tiles away.');
+  end;
+
+  if WalkDeadline = 0 then
+    Exit;
+
+  inVarrockNow := (position.DistanceTo(ESS_BANK_SPOT) <= 40 * RSTranslator.TILE_SIZE) or
+                  (position.DistanceTo(ESS_AUBURY_SPOT) <= 40 * RSTranslator.TILE_SIZE);
+
+  if EssWalkStartedInMine and inVarrockNow then
+  begin
+    Logger.Info('Walk: we left the mine mid-walk, stopping the walk.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+  end
+  else if GetTimeRunning() > WalkDeadline then
+  begin
+    Logger.Warn('Walk: took too long, stopping it.');
+    walker^.Walking := False;
+    WalkDeadline := 0;
+  end;
+end;
+
+// WaspLib's walker with the watchdog armed (max `ms` milliseconds)
+function EssWebWalk(dest: TPoint; ms: Integer; inMine: Boolean): Boolean;
+begin
+  EssWalkStartedInMine := inMine;
+  WalkDeadline := GetTimeRunning() + ms;
+  try
+    Result := Map.Walker.WebWalk(dest, 8, 0.3);
+  except
+    Logger.Warn('Walk: WaspLib''s walker failed: ' + GetExceptionMessage());
+    Result := False;
+  end;
+  WalkDeadline := 0;
+end;
+
+// ---------------------------------------------------------------- helpers
+
+// Hovers points around `center` in growing rings until the hover text contains one of
+// `texts`. Leaves the mouse there (does NOT click) and returns the spot.
+function EssHoverFind(center: TPoint; texts: TStringArray; radius, step: Integer; out spot: TPoint): Boolean;
+var
+  r, k, n: Integer;
+  pt: TPoint;
+  a: Double;
+begin
+  r := 0;
+  while r <= radius do
+  begin
+    if r = 0 then
+      n := 1
+    else
+      n := Max(6, Round(2 * PI * r / step));
+
+    for k := 0 to n - 1 do
+    begin
+      a := 2 * PI * k / n;
+      pt := Point(center.X + Round(r * Cos(a)) + Random(-2, 2), center.Y + Round(r * Sin(a)) + Random(-2, 2));
+      if not MainScreen.Bounds.Contains(pt) then
+        Continue;
+
+      Mouse.Move(pt);
+      if MainScreen.IsUpText(texts, True, 0.85, 60) then
+      begin
+        spot := pt;
+        Exit(True);
+      end;
+    end;
+
+    r += step;
+  end;
+end;
+
+// Click a point on the minimap in the direction of `wp` (capped to the minimap's reach).
+procedure EssClickTowards(me, wp: TPoint);
+var
+  mm: TPoint;
+  vx, vy, len: Double;
+begin
+  mm := TWalker.Point2MM(me, wp, Minimap.CompassRadians);
+  vx := mm.X - Minimap.Center.X;
+  vy := mm.Y - Minimap.Center.Y;
+  len := Sqrt(vx * vx + vy * vy);
+  if len > 52 then
+  begin
+    vx := vx / len * 52;
+    vy := vy / len * 52;
+  end;
+  Mouse.Click(Point(Minimap.Center.X + Round(vx) + Random(-1, 1), Minimap.Center.Y + Round(vy) + Random(-1, 1)), EMouseButton.LEFT);
+end;
+
+// LOCAL WALKER: click the exact tile on the main screen (more precise than the minimap for
+// the last few tiles). Uses "Walk here" from the right-click menu if left-click would do
+// something else (talk to someone, open the bank...). False if the tile isn't on screen.
+function EssClickTileOnScreen(me, wp: TPoint): Boolean;
+var
+  mm, ms: TPoint;
+begin
+  mm := TWalker.Point2MM(me, wp, Minimap.CompassRadians);
+  ms := Minimap.Vector2MSQuad([mm.X, mm.Y, 0], Minimap.CompassRadians).Bounds.Center;
+  if not MainScreen.Bounds.Contains(ms) then
+    Exit(False);
+
+  Mouse.Move(Point(ms.X + Random(-3, 3), ms.Y + Random(-3, 3)));
+  Sleep(120, 250);
+  if MainScreen.IsUpText(['Walk here', 'Walk her', 'alk here'], True, 0.85, 80) then
+  begin
+    Mouse.Click(EMouseButton.LEFT);
+    Exit(True);
+  end;
+
+  // something else is on top of that tile: right-click -> Walk here
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+    Exit(False);
+  Sleep(150, 300);
+  Result := ChooseOption.Select(['Walk here', 'Walk her', 'alk here']);
+  if not Result then
+    CancelMenu();
+end;
+
+// Minimap click when far, local (main screen) click when within ESS_LOCAL_TILES of the spot.
+procedure EssStepTowards(me, wp: TPoint);
+begin
+  if (me.DistanceTo(wp) <= ESS_LOCAL_TILES * RSTranslator.TILE_SIZE) and EssClickTileOnScreen(me, wp) then
+    Exit;
+  EssClickTowards(me, wp);
+end;
+
+// Click the minimap `tiles` tiles away in a world direction (dx east, dy south), whatever way
+// the camera is facing. Works in the mine too, where WaspLib can't read our position.
+procedure EssClickDirection(dx, dy: Integer; tiles: Integer);
+var
+  base, mm: TPoint;
+begin
+  base := Point(20000, 20000);
+  mm := TWalker.Point2MM(base, Point(base.X + dx * tiles * 4, base.Y + dy * tiles * 4), Minimap.CompassRadians);
+  Mouse.Click(Point(mm.X + Random(-3, 3), mm.Y + Random(-3, 3)), EMouseButton.LEFT);
+end;
+
+// A closed door in the way: look for "Open Door" near the middle of the screen and click it.
+function EssOpenNearbyDoor(): Boolean;
+var
+  spot: TPoint;
+begin
+  if EssHoverFind(MainScreen.Bounds.Center, ['Open Door', 'Open Doo', 'pen Door'], 140, 18, spot) then
+  begin
+    Logger.Info('Walk: a door is in the way, opening it.');
+    Mouse.Click(EMouseButton.LEFT);
+    Sleep(1200, 1800);
+    Result := True;
+  end;
+end;
+
+// Backup walk to one spot with minimap / local clicks. True when within 2 tiles.
+function EssWalkToSpotManual(spot: TPoint; name: String): Boolean;
+var
+  me, wp: TPoint;
+  i: Integer;
+  d: Double;
+begin
+  wp := Point(spot.X + Random(-1, 1) * 4, spot.Y + Random(-1, 1) * 4);
+
+  for i := 1 to 8 do
+  begin
+    me := Map.Position();
+    if (me.X = 0) and (me.Y = 0) then
+    begin
+      Logger.Warn('Walk: position unknown.');
+      Exit;
+    end;
+
+    d := me.DistanceTo(wp) / RSTranslator.TILE_SIZE;
+    if d <= 2 then
+      Exit(True);
+
+    // a spot this far away was recorded with a different map: don't wander off towards it
+    if d > 60 then
+    begin
+      Logger.Warn('Walk: the ' + name + ' spot is ' + ToStr(Round(d)) + ' tiles away, so it must be wrong. We are at [' +
+                  ToStr(me.X) + ', ' + ToStr(me.Y) + ']. Skipping the walk.');
+      Exit(False);
+    end;
+
+    Logger.Info('Walk: to the ' + name + ', ' + ToStr(Round(d)) + ' tiles away.');
+    EssStepTowards(me, wp);
+    Sleep(500, 800);
+    SleepUntil((Map.Position().DistanceTo(wp) <= 2 * RSTranslator.TILE_SIZE) or not Minimap.IsPlayerMoving(), 150, 7000);
+  end;
+
+  Result := Map.Position().DistanceTo(spot) <= 3 * RSTranslator.TILE_SIZE;
+end;
+
+// Walks the route bank -> Aubury (toShop) or Aubury -> bank, a minimap click per point.
+// In the essence mine? (within 40 tiles of one of the rock spots)
+function EssInMineArea(): Boolean;
+var
+  me, p: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(False);
+  for p in ESS_MINE_SPOTS do
+    if me.DistanceTo(p) <= 40 * RSTranslator.TILE_SIZE then
+      Exit(True);
+end;
+
+// Walk to one spot (mine rock areas, portals): WaspLib's walker first, manual clicks as backup.
+function EssWalkToSpot(spot: TPoint; name: String): Boolean;
+begin
+  if Map.Position().DistanceTo(spot) <= 2 * RSTranslator.TILE_SIZE then
+    Exit(True);
+
+  Result := EssWebWalk(spot, 25000, True);
+
+  // a portal / teleport took us out of the mine: nothing more to walk here
+  if not EssInMineArea() then
+    Exit(False);
+
+  if Result and (Map.Position().DistanceTo(spot) <= 3 * RSTranslator.TILE_SIZE) then
+    Exit(True);
+
+  Logger.Warn('Walk: WaspLib''s walker did not reach the ' + name + ', walking it by hand.');
+  Result := EssWalkToSpotManual(spot, name);
+end;
+
+// Your recorded route (backup for WaspLib's walker).
+function EssWalkRecordedRoute(toShop: Boolean): Boolean;
+var
+  path: TPointArray;
+  me, wp: TPoint;
+  i, start, stalls: Integer;
+  d, bestD, reach: Double;
+  pointEnd: UInt64;
+begin
+  if toShop then
+    path := ESS_ROUTE
+  else
+    for i := High(ESS_ROUTE) downto 0 do
+      path += ESS_ROUTE[i];
+
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+  begin
+    Logger.Warn('Walk: position unknown.');
+    Exit;
+  end;
+
+  start := 0;
+  bestD := 1000000000;
+  for i := 0 to High(path) do
+    if me.DistanceTo(path[i]) < bestD then
+    begin
+      bestD := me.DistanceTo(path[i]);
+      start := i;
+    end;
+
+  if bestD > 60 * RSTranslator.TILE_SIZE then
+  begin
+    Logger.Warn('Walk: the route is ' + ToStr(Round(bestD / RSTranslator.TILE_SIZE)) + ' tiles away, so the route spots must be wrong. We are at [' +
+                ToStr(me.X) + ', ' + ToStr(me.Y) + ']. Skipping the walk.');
+    Exit(False);
+  end;
+
+  if toShop then
+    Logger.Info('Walk: to Aubury.')
+  else
+    Logger.Info('Walk: to the bank.');
+
+  for i := start to High(path) do
+  begin
+    wp := path[i];
+    if i < High(path) then
+    begin
+      wp := Point(wp.X + Random(-3, 3), wp.Y + Random(-3, 3));
+      reach := 2;
+    end
+    else
+      reach := 1;
+
+    stalls := 0;
+    pointEnd := GetTimeRunning() + 20000;
+    repeat
+      me := Map.Position();
+      d := me.DistanceTo(wp) / RSTranslator.TILE_SIZE;
+      if d <= reach then
+        Break;
+
+      if GetTimeRunning() > pointEnd then
+      begin
+        Logger.Warn('Walk: could not reach point ' + ToStr(i + 1) + '/' + ToStr(Length(path)) + ' (' + ToStr(Round(d)) + ' tiles away).');
+        Exit(False);
+      end;
+
+      EssStepTowards(me, wp);
+      Sleep(500, 800);
+      SleepUntil((Map.Position().DistanceTo(wp) <= reach * RSTranslator.TILE_SIZE) or not Minimap.IsPlayerMoving(), 150, 6000);
+
+      // didn't move at all: probably the shop door is closed
+      if Map.Position().DistanceTo(me) < RSTranslator.TILE_SIZE then
+      begin
+        Inc(stalls);
+        if stalls >= 2 then
+        begin
+          EssOpenNearbyDoor();
+          stalls := 0;
+        end;
+      end;
+    until False;
+  end;
+
+  Result := True;
+end;
+
+// Walk between the bank and Aubury: WaspLib's own walker first, your recorded route as the
+// backup if it fails, errors or doesn't get us there.
+function EssWalkRoute(toShop: Boolean): Boolean;
+var
+  dest: TPoint;
+  name: String;
+begin
+  if toShop then
+  begin
+    dest := ESS_AUBURY_SPOT;
+    name := 'Aubury';
+  end
+  else
+  begin
+    dest := ESS_BANK_SPOT;
+    name := 'the bank';
+  end;
+
+  if Map.Position().DistanceTo(dest) <= 3 * RSTranslator.TILE_SIZE then
+    Exit(True);
+
+  Logger.Info('Walk: to ' + name + ' with WaspLib''s walker.');
+  // up to 5 minutes: the miner can start this from anywhere on the F2P map, not just Varrock
+  Result := EssWebWalk(dest, 300000, False);
+
+  if Result and (Map.Position().DistanceTo(dest) <= 3 * RSTranslator.TILE_SIZE) then
+  begin
+    Logger.Info('Walk: arrived at ' + name + '.');
+    Exit(True);
+  end;
+
+  Logger.Warn('Walk: WaspLib''s walker did not get us to ' + name + ', using the recorded route.');
+  Result := EssWalkRecordedRoute(toShop);
+end;
+
+// In Varrock? (In the mine WaspLib can't place us, so the position is far off or empty.)
+function EssInVarrock(): Boolean;
+var
+  me: TPoint;
+begin
+  me := Map.Position();
+  if (me.X = 0) and (me.Y = 0) then
+    Exit(False);
+  Result := (me.DistanceTo(ESS_BANK_SPOT) <= 40 * RSTranslator.TILE_SIZE) or
+            (me.DistanceTo(ESS_AUBURY_SPOT) <= 40 * RSTranslator.TILE_SIZE);
+end;
+
+// Which of the four rock areas is closest to us (0..3)
+function EssNearestCorner(): Integer;
+var
+  me: TPoint;
+  i: Integer;
+  best: Double;
+begin
+  me := Map.Position();
+  best := 1000000000;
+  for i := 0 to High(ESS_MINE_SPOTS) do
+    if me.DistanceTo(ESS_MINE_SPOTS[i]) < best then
+    begin
+      best := me.DistanceTo(ESS_MINE_SPOTS[i]);
+      Result := i;
+    end;
+end;
+
+// ---------------------------------------------------------------- report / init
+
+function TEssMiner.GetReportValues(): TStringArray;
+var
+  xp: UInt64;
+begin
+  xp := XPBar.TotalEarnedXP(False);
+  Result := [
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    ToStr(Self.Mined),
+    FormatNumber(Self.Mined / Logger.TimeRunning.Elapsed * HOUR),
+    ToStr(Self.Trips),
+    FormatNumber(xp),
+    FormatNumber(xp / Logger.TimeRunning.Elapsed * HOUR)
+  ];
+end;
+
+// WaspLib knows every bank booth on the map. Take the one closest to our bank spot (the
+// counter right in front of it) as its own object, so we always click THAT booth.
+procedure TEssMiner.SetupBooth();
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  i, j, bi, bj: Integer;
+  best, d: Double;
+begin
+  try
+    all := MapObjects.GetByName('Bank booth');
+  except
+    Logger.Warn('Bank: could not read the bank booths from the map: ' + GetExceptionMessage());
+    Exit;
+  end;
+
+  best := 1000000000;
+  bi := -1;
+  for i := 0 to High(all) do
+    for j := 0 to High(all[i].Coordinates) do
+    begin
+      d := all[i].Coordinates[j].DistanceTo(ESS_BANK_SPOT);
+      if d < best then
+      begin
+        best := d;
+        bi := i;
+        bj := j;
+      end;
+    end;
+
+  if (bi = -1) or (best > 6 * RSTranslator.TILE_SIZE) then
+  begin
+    Logger.Warn('Bank: no bank booth known next to the bank spot, will search by hover text.');
+    Exit;
+  end;
+
+  single := all[bi];
+  single.Coordinates := [all[bi].Coordinates[bj]];
+  if bj <= High(all[bi].Rotations) then
+    single.Rotations := [all[bi].Rotations[bj]];
+  Self.Booth := TObject.Create(Map.Walker, single);
+  Self.HasBooth := True;
+  Logger.Info('Bank: using the bank booth at [' + ToStr(all[bi].Coordinates[bj].X) + ', ' + ToStr(all[bi].Coordinates[bj].Y) + '], ' +
+              ToStr(Round(best / RSTranslator.TILE_SIZE)) + ' tile(s) from the bank spot.');
+end;
+
+function EssKnownText(b: Boolean): String;
+begin
+  if b then
+    Result := 'known'
+  else
+    Result := 'NOT in map data (hover search)';
+end;
+
+// The object called one of `names` closest to `spot` (within maxTiles), as its own TObject.
+function EssNearestMapObject(names: TStringArray; spot: TPoint; maxTiles: Integer; out obj: TObject): Boolean;
+var
+  all: TMapObjectDataArray;
+  single: TMapObjectData;
+  name: String;
+  i, j, bi, bj: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  bi := -1;
+  for name in names do
+  begin
+    try
+      all := MapObjects.GetByName(name);
+    except
+      Continue;
+    end;
+
+    for i := 0 to High(all) do
+      for j := 0 to High(all[i].Coordinates) do
+      begin
+        d := all[i].Coordinates[j].DistanceTo(spot);
+        if d < best then
+        begin
+          best := d;
+          bi := i;
+          bj := j;
+          single := all[i];
+        end;
+      end;
+  end;
+
+  if (bi = -1) or (best > maxTiles * RSTranslator.TILE_SIZE) then
+    Exit(False);
+
+  single.Coordinates := [single.Coordinates[bj]];
+  if bj <= High(single.Rotations) then
+    single.Rotations := [single.Rotations[bj]];
+  obj := TObject.Create(Map.Walker, single);
+  Result := True;
+end;
+
+// Look up the essence rock and the exit portal for each rock area in WaspLib's object data.
+// The essence mine portal changes look on purpose: on every visit one of 7 variants is picked
+// (different colours, option "Use" or "Exit", and 2 of the variants are NPCs, not objects).
+// Only its POSITION never changes. So we take the portal's tile and size from WaspLib's
+// object or NPC data and make our own object with NO colours, just "Portal" as hover text.
+function EssFindPortalTile(spot: TPoint; out tile: TPoint; out size: Integer): Boolean;
+var
+  objs: TMapObjectDataArray;
+  npcs: TMapNPCDataArray;
+  i, j: Integer;
+  best, d: Double;
+begin
+  best := 1000000000;
+  size := 2;
+
+  try
+    objs := MapObjects.GetByName('Portal');
+  except
+    objs := [];
+  end;
+  for i := 0 to High(objs) do
+    for j := 0 to High(objs[i].Coordinates) do
+    begin
+      d := objs[i].Coordinates[j].DistanceTo(spot);
+      if d < best then
+      begin
+        best := d;
+        tile := objs[i].Coordinates[j];
+        size := Max(1, Max(objs[i].Size.X, objs[i].Size.Y));
+      end;
+    end;
+
+  try
+    npcs := MapNPCs.GetByName('Portal');
+  except
+    npcs := [];
+  end;
+  for i := 0 to High(npcs) do
+    for j := 0 to High(npcs[i].Coordinates) do
+    begin
+      d := npcs[i].Coordinates[j].DistanceTo(spot);
+      if d < best then
+      begin
+        best := d;
+        tile := npcs[i].Coordinates[j];
+        size := Max(1, npcs[i].Size);
+      end;
+    end;
+
+  Result := best <= 6 * RSTranslator.TILE_SIZE;
+end;
+
+procedure TEssMiner.SetupMineObjects();
+var
+  i, size: Integer;
+  obj: TObject;
+  tile: TPoint;
+begin
+  SetLength(Self.Rocks, Length(ESS_MINE_SPOTS));
+  SetLength(Self.HasRock, Length(ESS_MINE_SPOTS));
+  SetLength(Self.Portals, Length(ESS_PORTAL_SPOTS));
+  SetLength(Self.HasPortal, Length(ESS_PORTAL_SPOTS));
+
+  for i := 0 to High(ESS_MINE_SPOTS) do
+  begin
+    Self.HasRock[i] := EssNearestMapObject(['Essence', 'Rune Essence', 'Rune essence'], ESS_MINE_SPOTS[i], 10, obj);
+    if Self.HasRock[i] then
+      Self.Rocks[i] := obj;
+
+    Self.HasPortal[i] := EssFindPortalTile(ESS_PORTAL_SPOTS[i], tile, size);
+    if Self.HasPortal[i] then
+    begin
+      Self.Portals[i] := TObject.Create(Map.Walker, [size, size, 6], [tile], ['Portal']);
+      Logger.Info('Mine area ' + ToStr(i + 1) + ': portal at [' + ToStr(tile.X) + ', ' + ToStr(tile.Y) + '], ' + ToStr(size) + 'x' + ToStr(size) + ' tiles.');
+    end;
+
+    Logger.Info('Mine area ' + ToStr(i + 1) + ': rock ' + EssKnownText(Self.HasRock[i]) +
+                ', portal ' + EssKnownText(Self.HasPortal[i]) + '.');
+  end;
+end;
+
+// WaspLib's map data knows where Aubury stands: use that instead of searching for him.
+procedure TEssMiner.SetupAubury();
+var
+  data: TMapNPCDataArray;
+begin
+  try
+    data := MapNPCs.GetByName('Aubury', 1);
+  except
+    Logger.Warn('Teleport: could not read Aubury from the map data: ' + GetExceptionMessage());
+    Exit;
+  end;
+
+  if Length(data) = 0 then
+  begin
+    Logger.Warn('Teleport: Aubury is not in WaspLib''s NPC data, will use the NPC dots.');
+    Exit;
+  end;
+
+  Self.Aubury := TEntity.Create(Map.Walker, data[0]);
+  Self.HasAubury := True;
+  Logger.Info('Teleport: Aubury found in the map data.');
+end;
+
+procedure TEssMiner.Init();
+begin
+  Logger.Setup('DMB''s F2P Miner - Rune essence');
+  ProgressReport.Setup(
+    'DMB''s F2P Miner - Rune essence',
+    ['Script runtime:', 'Essence mined:', 'Essence/H:', 'Bank trips:', 'Total XP:', 'XP/H:'],
+    @Self.GetReportValues
+  );
+
+  if not Client.IsLoggedIn() then
+    DoLoginSafe();
+
+  StartListeners(300);
+
+  if Options.SetNPCAttack('Hidden') or Options.SetNPCAttack(3) then
+    Logger.Info('NPC attack option set to hidden.');
+
+  if not HasPickaxe(Stats.GetLevel(ESkill.MINING, False)) then
+  begin
+    if not DebugMode then
+      raise 'No pickaxe you can use (for your Mining level) in the inventory or worn. Get one and start again.';
+    Logger.Warn('DEBUG: no pickaxe you can use - carrying on without one.');
+  end
+  else
+    Logger.Info('Pickaxe found.');
+
+  // The whole F2P surface the miner uses (Falador to Al Kharid, Draynor to Edgeville), so
+  // WaspLib's walker can take us to Aubury from wherever we start, plus the rune essence mine.
+  Logger.Info('Map: loading the areas (this can take a moment the first time).');
+  Map.Setup([Chunk(Box(45, 54, 53, 48), 0), Chunk(Box(44, 77, 47, 74), 0)]);
+
+  Map.Walker.OnWalkEvent := @Map.Walker.EssWatchdog;
+  Map.Walker.OnWaitMovingEvent := @Map.Walker.EssWatchdog;
+
+  Self.SetupBooth();
+  Self.SetupAubury();
+  Self.SetupMineObjects();
+
+  Antiban.Zoom.Min := 15;
+  Antiban.Zoom.Max := 40;
+  Antiban.Skills := [ESkill.MINING, ESkill.TOTAL];
+  SlowAntiban();
+
+  Self.InMine := EssInMineArea();
+  if Self.InMine then
+    Logger.Info('Start: in the essence mine at [' + ToStr(Map.Position().X) + ', ' + ToStr(Map.Position().Y) + '].')
+  else
+    Logger.Info('Start: in Varrock at [' + ToStr(Map.Position().X) + ', ' + ToStr(Map.Position().Y) + '].');
+end;
+
+// ---------------------------------------------------------------- Varrock side
+
+function TEssMiner.DoBank(): Boolean;
+var
+  spot, counter: TPoint;
+  opened: Boolean;
+begin
+  if not Bank.IsOpen() then
+  begin
+    if not EssWalkRoute(False) then
+      Logger.Warn('Bank: did not reach the bank spot, trying from here.');
+
+    // 1. the known booth from the map
+    opened := False;
+    if Self.HasBooth then
+    begin
+      Logger.Info('Bank: clicking the known bank booth.');
+      try
+        opened := Self.Booth.WalkInteract(['Bank']);
+      except
+        Logger.Warn('Bank: booth click failed: ' + GetExceptionMessage());
+      end;
+    end;
+
+    // 2. fallback: hover the counter right in front of the bank spot (one tile north)
+    if not opened then
+    begin
+      Logger.Info('Bank: hovering the counter in front of us.');
+      counter := TWalker.Point2MM(Map.Position(), Point(ESS_BANK_SPOT.X, ESS_BANK_SPOT.Y - 4), Minimap.CompassRadians);
+      counter := Minimap.Vector2MSQuad([counter.X, counter.Y, 0], Minimap.CompassRadians).Bounds.Center;
+      if not EssHoverFind(counter, ['Bank Bank booth', 'Bank booth', 'Bank Banker', 'ank booth', 'Bank Bank'], 60, 12, spot) then
+      begin
+        Logger.Warn('Bank: no bank booth found in front of us.');
+        Inc(Self.Failures);
+        Exit;
+      end;
+      Mouse.Click(EMouseButton.LEFT);
+    end;
+
+    Map.Walker.WaitMoving();
+    if not SleepUntil(Bank.IsOpen(), 100, 6000) then
+    begin
+      Logger.Warn('Bank: clicked a booth, but the bank did not open.');
+      Inc(Self.Failures);
+      Exit;
+    end;
+  end;
+
+  Logger.Info('Bank: depositing ' + ToStr(Inventory.Items.Count(ESSENCE)) + ' essence (keeping the pickaxe).');
+  if Bank.DepositDifferent(PICKAXES) then
+    SleepUntil(not Inventory.Items.ContainsDifferent(PICKAXES), 100, 3000);
+
+  Inc(Self.Trips);
+  Self.Failures := 0;
+  Logger.Info('Bank: done, trip ' + ToStr(Self.Trips) + '. ' + ToStr(Self.Mined) + ' essence so far.');
+  Result := Bank.Close();
+  Activity.Restart();
+end;
+
+// Is Aubury under the mouse?
+function EssAuburyUnderMouse(): Boolean;
+begin
+  Result := MainScreen.IsUpText(['Aubury', 'ubury', 'Talk-to Aub'], True, 0.85, 80);
+end;
+
+// Look for Aubury at the NPC dots on the minimap: each dot is turned into its spot on the
+// main screen and only a few points on and just above that tile are hovered.
+function EssFindAuburyByDots(): Boolean;
+var
+  dots: TPointArray;
+  box: TBox;
+  pt: TPoint;
+  i, dx, dy: Integer;
+begin
+  dots := Minimap.GetDots(EDot.NPC).SortFrom(Minimap.Center);
+  Logger.Info('Teleport: ' + ToStr(Length(dots)) + ' NPC dot(s) on the minimap.');
+
+  for i := 0 to Min(High(dots), 7) do
+  begin
+    if dots[i].DistanceTo(Minimap.Center) > 60 then
+      Break;
+
+    box := Minimap.Vector2MSQuad([dots[i].X, dots[i].Y, 0], Minimap.CompassRadians).Bounds;
+    if not MainScreen.Bounds.Contains(box.Center) then
+      Continue;
+
+    // a person is about 1 tile wide and 2 tall: try the tile and just above it
+    for dy := 0 to 3 do
+      for dx := -1 to 1 do
+      begin
+        pt := Point(box.Center.X + dx * 8 + Random(-2, 2), box.Center.Y - dy * 12 - Random(0, 3));
+        if not MainScreen.Bounds.Contains(pt) then
+          Continue;
+        Mouse.Move(pt);
+        if EssAuburyUnderMouse() then
+        begin
+          Logger.Info('Teleport: found Aubury at NPC dot ' + ToStr(i + 1) + '.');
+          Exit(True);
+        end;
+      end;
+  end;
+end;
+
+// Walk to Aubury, right-click him, Teleport.
+function TEssMiner.Teleport(): Boolean;
+var
+  found: Boolean;
+  opts: TOptionArray;
+  menu: String;
+  i, pick: Integer;
+begin
+  if not EssWalkRoute(True) then
+    Logger.Warn('Teleport: did not reach Aubury''s spot, looking for him from here.');
+
+  Logger.Info('Teleport: we are at [' + ToStr(Map.Position().X) + ', ' + ToStr(Map.Position().Y) + '], ' +
+              ToStr(Round(Map.Position().DistanceTo(ESS_AUBURY_SPOT) / RSTranslator.TILE_SIZE)) + ' tiles from Aubury''s spot.');
+  // 1. WaspLib knows Aubury: hover him directly (his NPC dot + his size on screen)
+  if Self.HasAubury then
+  begin
+    Logger.Info('Teleport: hovering Aubury (WaspLib NPC data).');
+    try
+      found := Self.Aubury.Hover(['Aubury'], 3) and EssAuburyUnderMouse();
+    except
+      Logger.Warn('Teleport: WaspLib hover failed: ' + GetExceptionMessage());
+    end;
+  end;
+
+  // 2. otherwise only the NPC dots on the minimap (no searching the screen)
+  if not found then
+  begin
+    Logger.Info('Teleport: looking for Aubury by the NPC dots.');
+    found := EssFindAuburyByDots();
+  end;
+
+  if not found then
+  begin
+    Logger.Warn('Teleport: Aubury not found on the screen.');
+    Inc(Self.Failures);
+    Exit;
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+  if not SleepUntil(ChooseOption.IsOpen(), 50, 1000) then
+    Exit;
+  Sleep(200, 450);
+
+  // The menu reader garbles "Teleport" (it has read it as "Teleoort" before), so match loosely:
+  // any line starting with "Tel"/"Tele", or failing that the 3rd line (Talk-to, Trade, Teleport).
+  opts := ChooseOption.GetOptions();
+  menu := '';
+  pick := -1;
+  for i := 0 to High(opts) do
+  begin
+    menu += '[' + opts[i].Text + '] ';
+    if (pick = -1) and ((Pos('Tel', opts[i].Text) = 1) or (Pos('Tele', opts[i].Text) > 0) or (Pos('elep', opts[i].Text) > 0) or (Pos('eleo', opts[i].Text) > 0)) then
+      pick := i;
+  end;
+  Logger.Info('Teleport: menu: ' + menu);
+
+  if (pick = -1) and (Length(opts) >= 6) and (Pos('Talk', opts[0].Text) > 0) and (Pos('rade', opts[1].Text) > 0) then
+    pick := 2;
+
+  if pick = -1 then
+  begin
+    // ticked but the option isn't there: double-check in game. Twice in a row = stop.
+    Logger.Warn('Teleport: no Teleport option on Aubury (Rune Mysteries done?).');
+    CancelMenu();
+    Inc(Self.NoTeleport);
+    if Self.NoTeleport >= 2 then
+    begin
+      Logger.Error('Aubury has no Teleport option - Rune Mysteries does not look done. Stopping.');
+      Self.Failures := 99;
+    end
+    else
+      Inc(Self.Failures);
+    Exit;
+  end;
+
+  ChooseOption.Select(opts[pick]);
+
+  Logger.Info('Teleport: Aubury is sending us to the essence mine.');
+  Sleep(2500, 3500);
+
+  if not SleepUntil(EssInMineArea(), 300, 6000) then
+  begin
+    Logger.Warn('Teleport: not in the essence mine after the teleport.');
+    Inc(Self.Failures);
+    Exit;
+  end;
+
+  Self.InMine := True;
+  Self.Failures := 0;
+  Self.Dir := -1;
+  Result := True;
+end;
+
+// ---------------------------------------------------------------- mine side
+
+// Walk to the nearest rock area (the teleport drops us somewhere random), then click the
+// essence rock there. If it can't be found, try the next rock area.
+function TEssMiner.ClickRock(): Boolean;
+var
+  spot: TPoint;
+  attempt: Integer;
+const
+  TEXTS: TStringArray = ['Mine Essence', 'Mine Rune Essence', 'ine Ess', 'Essence'];
+begin
+  if Self.Dir = -1 then
+  begin
+    Self.Dir := EssNearestCorner();
+    Logger.Info('Mine: nearest rock area is number ' + ToStr(Self.Dir + 1) + '.');
+  end;
+
+  for attempt := 1 to 4 do
+  begin
+    if not EssWalkToSpot(ESS_MINE_SPOTS[Self.Dir], 'rock area ' + ToStr(Self.Dir + 1)) then
+      Logger.Warn('Mine: did not reach rock area ' + ToStr(Self.Dir + 1) + ', looking from here.');
+    Map.Walker.WaitMoving();
+
+    // the rock from WaspLib's object data
+    if Self.HasRock[Self.Dir] then
+    begin
+      try
+        if Self.Rocks[Self.Dir].Interact(['Mine']) then
+        begin
+          Logger.Info('Mine: clicked the essence rock (area ' + ToStr(Self.Dir + 1) + ', map data).');
+          Exit(True);
+        end;
+      except
+        Logger.Warn('Mine: WaspLib rock click failed: ' + GetExceptionMessage());
+      end;
+    end
+    // not in the map data: hover search around us
+    else if EssHoverFind(MainScreen.Bounds.Center, TEXTS, 220, 22, spot) then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Logger.Info('Mine: clicked the essence rock (area ' + ToStr(Self.Dir + 1) + ').');
+      Exit(True);
+    end;
+
+    Logger.Info('Mine: no rock found at area ' + ToStr(Self.Dir + 1) + '.');
+    if attempt >= 2 then
+      Self.Dir := (Self.Dir + 1) mod Length(ESS_MINE_SPOTS);   // try another area
+  end;
+
+  Logger.Warn('Mine: could not find an essence rock.');
+  Inc(Self.Failures);
+end;
+
+procedure TEssMiner.DoMine();
+var
+  last, start: Integer;
+begin
+  if not Self.ClickRock() then
+    Exit;
+
+  Map.Walker.WaitMoving();
+  start := Inventory.Items.Count(ESSENCE);
+
+  // mining keeps going on its own; re-click if nothing comes in for 10 s
+  repeat
+    last := Inventory.Items.Count(ESSENCE);
+    if Inventory.IsFull() then
+      Break;
+    if Chat.LeveledUp() then
+    begin
+      Logger.Info('Mine: level up.');
+      Break;
+    end;
+    Antiban.DoAntiban();
+  until not SleepUntil(Inventory.Items.Count(ESSENCE) > last, 200, 10000);
+
+  Self.Mined += Max(0, Inventory.Items.Count(ESSENCE) - start);
+  Logger.Info('Mine: ' + ToStr(Inventory.Items.Count(ESSENCE)) + ' essence in the inventory, ' + ToStr(Self.Mined) + ' mined in total.');
+  Self.Failures := 0;
+  Activity.Restart();
+end;
+
+// Leave the mine: walk to the portal for our rock area and click it by its known position.
+// After clicking a portal: wait for the teleport and check we are back in Varrock.
+function TEssMiner.LeftMine(): Boolean;
+begin
+  Map.Walker.WaitMoving();
+  Sleep(2000, 3000);
+  if SleepUntil(EssInVarrock(), 300, 8000) then
+  begin
+    Self.InMine := False;
+    Activity.Restart();
+    Logger.Info('Exit: back in Varrock.');
+    Exit(True);
+  end;
+  Logger.Warn('Exit: still in the mine after the portal click.');
+end;
+
+function TEssMiner.LeaveMine(): Boolean;
+var
+  spot, pt, me: TPoint;
+  attempt: Integer;
+  found: Boolean;
+const
+  TEXTS: TStringArray = ['Use Portal', 'Exit Portal', 'Portal', 'ortal'];
+begin
+  // the portal that goes with the rock area we are at
+  Self.Dir := EssNearestCorner();
+  Logger.Info('Exit: going to portal ' + ToStr(Self.Dir + 1) + '.');
+  if not EssWalkToSpot(ESS_PORTAL_SPOTS[Self.Dir], 'exit portal') then
+    Logger.Warn('Exit: did not reach the portal spot, looking from here.');
+  Map.Walker.WaitMoving();
+
+  // walking next to the portal can already take us through it
+  if EssInVarrock() then
+  begin
+    Self.InMine := False;
+    Activity.Restart();
+    Logger.Info('Exit: we are back in Varrock.');
+    Exit(True);
+  end;
+
+  // the portal from WaspLib's object data. WaspLib can click the portal and still report
+  // False, so ALWAYS check afterwards whether we left the mine.
+  if Self.HasPortal[Self.Dir] then
+  begin
+    try
+      if Self.Portals[Self.Dir].Interact(['Use', 'Portal', 'Exit']) then
+        Logger.Info('Exit: clicked portal ' + ToStr(Self.Dir + 1) + ' (map data).')
+      else
+        Logger.Info('Exit: WaspLib says the portal click failed, checking anyway.');
+    except
+      Logger.Warn('Exit: WaspLib portal click failed: ' + GetExceptionMessage());
+    end;
+    if Self.LeftMine() then
+      Exit(True);
+  end;
+
+  for attempt := 1 to 5 do
+  begin
+    // already out (a click that "failed" may still have worked): stop searching
+    if EssInVarrock() then
+    begin
+      Self.InMine := False;
+      Activity.Restart();
+      Logger.Info('Exit: we are already back in Varrock.');
+      Exit(True);
+    end;
+
+    // fallback: the portal stands right next to your portal spot, so hover only around that
+    // spot on the screen (its colour changes every visit, so colour can't be trusted)
+    found := False;
+    me := Map.Position();
+    pt := TWalker.Point2MM(me, ESS_PORTAL_SPOTS[Self.Dir], Minimap.CompassRadians);
+    pt := Minimap.Vector2MSQuad([pt.X, pt.Y, 0], Minimap.CompassRadians).Bounds.Center;
+    if MainScreen.Bounds.Contains(pt) then
+    begin
+      Logger.Info('Exit: hovering around the portal spot.');
+      found := EssHoverFind(Point(pt.X, pt.Y - 15), TEXTS, 90, 14, spot);
+    end;
+
+    if found then
+    begin
+      Mouse.Click(EMouseButton.LEFT);
+      Logger.Info('Exit: clicked a portal.');
+      if Self.LeftMine() then
+        Exit(True);
+      Continue;
+    end;
+
+    Logger.Info('Exit: no portal found, walking to the portal spot again.');
+    EssWalkToSpot(ESS_PORTAL_SPOTS[Self.Dir], 'exit portal');
+  end;
+
+  Logger.Warn('Exit: could not find a portal.');
+  Inc(Self.Failures);
+end;
+
+// ---------------------------------------------------------------- main loop
+
+function TEssMiner.GetState(): EEssState;
+begin
+  if Activity.IsFinished then
+    Exit(EEssState.NO_ACTIVITY);
+
+  if not Client.IsLoggedIn() then
+    Exit(EEssState.LOGIN);
+
+  if Chat.LeveledUp() then
+    Exit(EEssState.LEVEL_UP);
+
+  if Bank.IsOpen() then
+    Exit(EEssState.BANK);
+
+  // finish the current trip before stopping: stop only in Varrock with an empty inventory
+  if (Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime) and
+     (not Self.InMine) and (Inventory.Items.Count(ESSENCE) = 0) then
+    Exit(EEssState.MAX_TIME);
+
+  // safety net: we think we are in the mine but are actually in Varrock (or the other way)
+  if Self.InMine and EssInVarrock() then
+  begin
+    Logger.Info('State: we are in Varrock, not the mine.');
+    Self.InMine := False;
+  end
+  else if (not Self.InMine) and EssInMineArea() then
+  begin
+    Logger.Info('State: we are in the mine.');
+    Self.InMine := True;
+    Self.Dir := -1;
+  end;
+
+  if Self.InMine then
+  begin
+    if Inventory.IsFull() or ((Self.MaxTime > 0) and (Logger.TimeRunning.Elapsed >= Self.MaxTime)) then
+      Exit(EEssState.LEAVE_MINE);
+    Exit(EEssState.MINE);
+  end;
+
+  if Inventory.Items.Count(ESSENCE) > 0 then
+    Exit(EEssState.OPEN_BANK);
+
+  Result := EEssState.TELEPORT;
+end;
+
+procedure TEssMiner.Run();
+begin
+  Self.Init();
+
+  repeat
+    CloseStrayInterface();
+    UnselectItem();
+    Self.State := Self.GetState();
+    Logger.Info('State: ' + ToStr(Self.State));
+    ProgressReport.Print();
+    WaspClient.SubmitStats();
+
+    case Self.State of
+      EEssState.LOGIN: DoLoginSafe();
+      EEssState.LEVEL_UP: Chat.HandleLevelUp();
+      EEssState.BANK, EEssState.OPEN_BANK: Self.DoBank();
+      EEssState.TELEPORT: Self.Teleport();
+      EEssState.MINE: Self.DoMine();
+      EEssState.LEAVE_MINE: Self.LeaveMine();
+
+      EEssState.NO_ACTIVITY, EEssState.MAX_TIME: Break;
+    end;
+
+    if Self.Failures >= 6 then
+    begin
+      Logger.Error('Too many failures in a row, stopping. Please post the log in a GitHub issue.');
+      Break;
+    end;
+
+    if WildernessHit or (InWilderness(Map.Position()) and ReallyInWilderness()) then
+    begin
+      Logger.Error('WILDERNESS: we are in or heading into the Wilderness - logging out and stopping.');
+      try
+        Logout.Logout();
+      except
+      end;
+      Break;
+    end;
+
+    Antiban.DoAntiban();
+  until False;
+
+  Logger.Info('Stopped: ' + ToStr(Self.State));
+end;
+
+var
+  EssMiner: TEssMiner;
+
+procedure SetClientInputLocked(locked: Boolean);
+begin
+  if RemoteInput.Target = nil then
+    Exit;
+  EIOS_SetMouseInputEnabled(RemoteInput.Target, not locked);
+  EIOS_SetKeyboardInputEnabled(RemoteInput.Target, not locked);
+  if locked then
+    Logger.Info('Client locked: your real mouse and keyboard are ignored by RuneLite.')
+  else
+    Logger.Info('Client unlocked.');
+end;
+
+// ---------------------------------------------------------------- GUI
+
+var
+  Miner: TMiner;
+  MinerForm: TScriptForm;
+  RuntimeEdit: TLazEdit;
+  MineSelector: TLazComboBox;
+  OreBoxes: array of TLazCheckBox;
+  PowerBox, RuneMysteriesBox, DebugBox: TLazCheckBox;
+  RuneMysteriesDone: Boolean;   // ticked in the GUI (WaspLib can't read the quest tab)
+  GuiMiningLevel: Integer;      // read before the GUI opens (0 = couldn't read it)
+  GuiCraftLevel: Integer;       // same for Crafting (Crafting Guild)
+  MineIndex: TIntegerArray;     // GUI row -> index in MINES
+  PreviewPic: TLazImage;
+  StartLocked: String;          // set when Start is pressed on a locked mine: why it's locked
+
+// Why the player can't use this mine yet ('' = they can). Levels we couldn't read count as met.
+function MineLockReason(m: TMineInfo): String;
+begin
+  if DebugMode then
+    Exit('');                   // debug: nothing is locked
+  if (GuiMiningLevel > 0) and (m.ReqLevel > GuiMiningLevel) then
+    Result := 'needs ' + ToStr(m.ReqLevel) + ' Mining (you have ' + ToStr(GuiMiningLevel) + ')';
+  if (GuiCraftLevel > 0) and (m.ReqCraft > GuiCraftLevel) then
+  begin
+    if Result <> '' then
+      Result += ', ';
+    Result += 'needs ' + ToStr(m.ReqCraft) + ' Crafting (you have ' + ToStr(GuiCraftLevel) + ')';
+  end;
+end;
+
+// Only the ores the chosen mine actually has (and the player has the level for) can be ticked; the rest are greyed out and
+// unticked. If nothing is left ticked, the first ore the mine has is ticked.
+procedure TScriptForm.OnMineChange(sender: TLazObject);
+var
+  m: TMineInfo;
+  o, k: Integer;
+  has, anyTicked, locked: Boolean;
+begin
+  m := MINES[MineIndex[Max(0, MineSelector.ItemIndex)]];
+  DebugMode := DebugBox.Checked;
+  locked := MineLockReason(m) <> '';
+
+  // essence is always banked
+  PowerBox.Enabled := (m.Name <> ESS_MINE_NAME) and not locked;
+  if not PowerBox.Enabled then
+    PowerBox.Checked := False;
+  // Rune Mysteries only matters for the essence mine (Aubury's Teleport)
+  RuneMysteriesBox.Enabled := (m.Name = ESS_MINE_NAME) and not locked;
+  for o := 0 to High(ORE_WORDS) do
+  begin
+    has := False;
+    for k := 0 to High(m.Ores) do
+      if m.Ores[k] = ORE_WORDS[o] then
+        has := True;
+    // ...and only ores the player has the Mining level for
+    if (GuiMiningLevel > 0) and (GuiMiningLevel < ORE_LEVELS[o]) and not DebugMode then
+      has := False;
+    // a locked mine: everything greyed out
+    if locked then
+      has := False;
+    OreBoxes[o].Enabled := has;
+    if not has then
+      OreBoxes[o].Checked := False;
+    if OreBoxes[o].Checked then
+      anyTicked := True;
+  end;
+
+  if not anyTicked then
+    for o := 0 to High(ORE_WORDS) do
+      if OreBoxes[o].Enabled then
+      begin
+        OreBoxes[o].Checked := True;
+        Break;
+      end;
+end;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  minutes, o: Integer;
+begin
+  minutes := StrToInt(Trim(RuntimeEdit.Text), 60);
+  if minutes < 1 then
+    minutes := 60;
+  Miner.MaxTime := minutes * MINUTE;
+  EssMiner.MaxTime := minutes * MINUTE;
+
+  Miner.Mine := MINES[MineIndex[Max(0, MineSelector.ItemIndex)]];
+  DebugMode := DebugBox.Checked;
+  if DebugMode then
+    Logger.Warn('DEBUG MODE: level, quest and item checks only warn - for testing the walking.');
+  StartLocked := MineLockReason(Miner.Mine);
+  SetLength(Miner.Want, Length(ORE_ROCKS));
+  for o := 0 to High(ORE_ROCKS) do
+    Miner.Want[o] := OreBoxes[o].Checked;
+  Miner.PowerMine := PowerBox.Checked;
+  // Prince Ali Rescue: no tick-box any more - the gate is just tried ("Open" first) and the
+  // bot remembers it was free
+  Miner.PrinceAli := False;
+  RuneMysteriesDone := RuneMysteriesBox.Checked;
+
+  inherited();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  i, j: Integer;
+  txt, imgPath: String;
+begin
+  if GuiMiningLevel > 0 then
+    Self.Setup('DMB''s F2P Miner - Mining level ' + ToStr(GuiMiningLevel))
+  else
+    Self.Setup('DMB''s F2P Miner');
+  tab := Self.CreateTab('Miner');
+
+  RuntimeEdit := TLazEdit.CreateEx(tab, 'Runtime (minutes):', 'How long to run. It banks what it has before stopping.', 40, 40, 200);
+  RuntimeEdit.Text := '60';
+
+  MineSelector := TLazComboBox.CreateEx(tab, 'Mine:', 'Where to mine. The bot walks there from wherever you are.', 40, 110, 320);
+  SetLength(MineIndex, 0);
+  for i := 0 to High(MINES) do
+  begin
+    // every mine is listed; the ones we can't use yet are marked LOCKED (a drop-down list
+    // can't grey out a single line) and greyed out below when picked
+    MineIndex += i;
+    txt := MINES[i].Name + ' (';
+    for j := 0 to High(MINES[i].Ores) do
+    begin
+      if j > 0 then
+        txt += ', ';
+      txt += MINES[i].Ores[j];
+    end;
+    if MINES[i].ReqLevel > 0 then
+      txt += ', needs ' + ToStr(MINES[i].ReqLevel) + ' Mining';
+    if MINES[i].ReqCraft > 0 then
+      txt += ', needs ' + ToStr(MINES[i].ReqCraft) + ' Crafting + apron';
+    txt += ')';
+    if MineLockReason(MINES[i]) <> '' then
+      txt += ' - LOCKED: ' + MineLockReason(MINES[i]);
+    MineSelector.Items.Add(txt);
+  end;
+  MineSelector.ItemIndex := 0;
+
+  // your picture: Scripts\images\dmb_f2p_miner.png (shown if it exists)
+  imgPath := {$MACRO DIR} + 'images' + PATH_SEP + 'dmb_f2p_miner.png';
+  if not FileExists(imgPath) then
+    imgPath := {$MACRO DIR} + 'dmb_f2p_miner.png';      // old place: next to the script
+  if FileExists(imgPath) then
+  begin
+    PreviewPic := TLazImage.CreateEx(tab);
+    PreviewPic.SetBounds(470, 30, 300, 440);
+    PreviewPic.Stretch := True;
+    PreviewPic.Proportional := True;
+    PreviewPic.Picture.LoadFromFile(imgPath);
+  end;
+
+  PowerBox := TLazCheckBox.CreateEx(tab, 'Power mine (drop ores instead of banking)', 'Drops the ores and gems when the inventory is full.', 40, 180);
+  RuneMysteriesBox := TLazCheckBox.CreateEx(tab, 'Rune Mysteries done (Aubury teleport)', 'Needed for the rune essence mine: Aubury only teleports you after Rune Mysteries.', 40, 210);
+  // debugging: lets LOCKED mines and too-high ores run, and missing items only warn
+  DebugBox := TLazCheckBox.CreateEx(tab, 'Debug: turn off the level, quest and item checks',
+    'For testing the walking only. LOCKED mines and too-high ores can be picked, and a missing pickaxe / apron / Rune Mysteries only gives a warning. The game itself still won''t let you mine or enter what you lack.', 40, 400);
+
+  for i := 0 to High(ORE_ROCKS) do
+  begin
+    OreBoxes += TLazCheckBox.CreateEx(tab, ORE_WORDS[i] + ' (' + ToStr(ORE_LEVELS[i]) + ')',
+                                      'Mine ' + ORE_ROCKS[i] + ' if the mine has them.',
+                                      40 + (i mod 3) * 150, 285 + (i div 3) * 36);
+  end;
+  OreBoxes[3].Checked := True;   // iron by default
+
+  // grey out the ores the chosen mine doesn't have (and update whenever the mine changes, or
+  // the debug box is ticked / unticked)
+  MineSelector.OnChange := @Self.OnMineChange;
+  DebugBox.OnChange := @Self.OnMineChange;
+  Self.OnMineChange(nil);
+
+  Self.CreateAntibanTab();
+  Self.CreateMiscTab();
+  Self.Run();
+end;
+
+begin
+  Logger.Info('*** Make sure your settings match the WaspLib suggested settings (Fixed - Classic layout, the right RuneLite profile). Wrong settings make the bot misread the screen. ***');
+  SetupMines();
+
+  // Read the Mining level BEFORE the GUI, so ores that are too high can be greyed out.
+  // (Logs in first if needed: the Skills tab can only be read in game.)
+  Logger.Info('Reading your Mining level before opening the settings...');
+  try
+    if not Client.IsLoggedIn() then
+      DoLoginSafe();
+    GuiMiningLevel := Stats.GetLevel(ESkill.MINING, False);
+    GuiCraftLevel := Stats.GetLevel(ESkill.CRAFTING, False);
+    Inventory.Open();
+  except
+    Logger.Warn('Could not read the Mining level: ' + GetExceptionMessage());
+    GuiMiningLevel := 0;
+  end;
+  if GuiMiningLevel > 0 then
+    Logger.Info('Mining level: ' + ToStr(GuiMiningLevel) + ', Crafting level: ' + ToStr(GuiCraftLevel) + '.')
+  else
+    Logger.Warn('Mining level unknown - no ores will be greyed out for level.');
+
+  MinerForm.Init();
+  SetClientInputLocked(True);
+  try
+    if StartLocked <> '' then
+      Logger.Error(Miner.Mine.Name + ' is locked: ' + StartLocked + '. Pick another mine.')
+    else if Miner.Mine.Name = ESS_MINE_NAME then
+    begin
+      if RuneMysteriesDone or DebugMode then
+      begin
+        if not RuneMysteriesDone then
+          Logger.Warn('DEBUG: Rune Mysteries not ticked - running the essence mine anyway (Aubury won''t teleport you).');
+        EssMiner.Run();
+      end
+      else
+        Logger.Error('The rune essence mine needs Rune Mysteries (Aubury won''t teleport you). ' +
+                     'Tick "Rune Mysteries done" in the settings if you have it.');
+    end
+    else
+      Miner.Run();
+  finally
+    SetClientInputLocked(False);
+  end;
+end.

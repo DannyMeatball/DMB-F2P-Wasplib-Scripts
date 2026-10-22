@@ -1,0 +1,75 @@
+{$I WaspLib/main.simba}
+
+// Test: teleport out with the cowbell amulet (worn or in the inventory), exactly like the
+// Brutus script does when it runs out of food. It does NOT log out afterwards.
+// It logs the amulet's right-click menu, so if it can't find the teleport option, paste the
+// "Cowbell amulet menu:" line to me.
+
+function TeleportOut(): Boolean;
+var
+  amulet: TItem;
+  opt: TOption;
+  opts: String;
+  worn: Boolean;
+begin
+  amulet := 'Cowbell amulet';
+
+  if Inventory.Items.Count(amulet) > 0 then
+  begin
+    worn := False;
+    Inventory.Open();
+    Logger.Info('Cowbell amulet found in the inventory.');
+  end
+  else if Equipment.Open() and (Equipment.Items.Count(amulet) > 0) then
+  begin
+    worn := True;
+    Logger.Info('Cowbell amulet found in the equipment tab.');
+  end
+  else
+  begin
+    Logger.Warn('No cowbell amulet in the inventory or worn.');
+    Exit;
+  end;
+
+  if worn then
+    Result := Equipment.Items.Hover(amulet)
+  else
+    Result := Inventory.Items.Hover(amulet);
+
+  if not Result then
+  begin
+    Logger.Warn('Could not hover the cowbell amulet.');
+    Exit(False);
+  end;
+
+  Mouse.Click(EMouseButton.RIGHT);
+
+  for opt in ChooseOption.GetOptions() do
+    opts += '[' + opt.Text + '] ';
+  Logger.Info('Cowbell amulet menu: ' + opts);
+
+  Result := ChooseOption.Select(['Tele']);
+  if not Result then
+  begin
+    Logger.Warn('No teleport option in the cowbell amulet menu.');
+    ChooseOption.Close();
+  end;
+end;
+
+begin
+  Logger.Setup('Teleport Test');
+
+  if not Client.IsLoggedIn() then
+    Login.DoLogin();
+
+  StartListeners(300);
+
+  if TeleportOut() then
+  begin
+    Logger.Info('Teleport option clicked. Waiting for it to finish...');
+    Sleep(5000, 6000);
+    Logger.Info('Done. Did you end up outside the arena?');
+  end
+  else
+    Logger.Warn('The teleport did not work.');
+end.
